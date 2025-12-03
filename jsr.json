@@ -1,0 +1,26 @@
+{
+  "name": "@supabase-router/core",
+  "version": "1.0.0",
+  "exports": "./mod.ts",
+  "publish": {
+    "include": [
+      "mod.ts",
+      "router.ts",
+      "core/*.ts",
+      "routing/*.ts",
+      "security/*.ts",
+      "validation/*.ts",
+      "authentication/*.ts",
+      "middleware/*.ts",
+      "errors/*.ts",
+      "examples/*.ts",
+      "docs/*.ts",
+      "README.md",
+      "LICENSE",
+      "CHANGELOG.md",
+      "TESTING.md",
+      "DEPENDENCY_INJECTION.md",
+      "GETTING_STARTED.md"
+    ]
+  }
+}

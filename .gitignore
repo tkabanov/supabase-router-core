@@ -1,0 +1,16 @@
+__tests__/
+coverage/
+*.lcov
+.coveragerc
+deno.json
+deno.lock
+scripts/
+*.md
+!README.md
+!CHANGELOG.md
+!SERVERLESS.md
+!SECURITY.md
+!TESTING.md
+!DEPENDENCY_INJECTION.md
+!GETTING_STARTED.md
+!LICENSE
