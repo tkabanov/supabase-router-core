@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 — unreleased
+## 2.0.0 — 2026-09-28
 
 ### Caller context, router kit and hooks
 
