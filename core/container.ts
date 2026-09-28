@@ -1,35 +1,6 @@
-import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
-import type { drizzle as drizzleFactory } from "npm:drizzle-orm/postgres-js";
-
-type TransactionDbClient = ReturnType<typeof drizzleFactory>;
-
-/**
- * Module-level cache for Supabase clients
- * 
- * IMPORTANT: In serverless environments (Deno Deploy, Supabase Edge Functions):
- * - Cache works within a single warm instance (reused across multiple requests)
- * - Cache is reset on cold starts (new instance initialization)
- * - This is a performance optimization, not a guarantee
- * 
- * For best results, create container at module level (not per-request):
- * ```typescript
- * // ✅ Good - container created once at module level
- * const container = createContainer({...});
- * const router = defineRouter({ container, routes: [...] });
- * 
- * // ❌ Bad - container created per request (cache doesn't help)
- * Deno.serve(async (req) => {
- *   const container = createContainer({...});
- *   // ...
- * });
- * ```
- */
-let moduleCachedAnonClient: SupabaseClient | null = null;
-let moduleCachedAnonUrl: string | undefined;
-let moduleCachedAnonKey: string | undefined;
-let moduleCachedServiceClient: SupabaseClient | null = null;
-let moduleCachedServiceUrl: string | undefined;
-let moduleCachedServiceKey: string | undefined;
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { TransactionDbClient } from "./types.ts";
+import { resolveSupabaseKeys } from "./supabase-keys.ts";
 
 /**
  * Logger interface for dependency injection
@@ -45,8 +16,11 @@ let moduleCachedServiceKey: string | undefined;
  * ```
  */
 export interface Logger {
+  /** Log an informational message */
   log(message: string, ...args: unknown[]): void;
+  /** Log an error */
   error(message: string, ...args: unknown[]): void;
+  /** Log a warning */
   warn(message: string, ...args: unknown[]): void;
 }
 
@@ -62,6 +36,7 @@ export interface Logger {
  * ```
  */
 export interface IdGenerator {
+  /** Return a new unique ID */
   generate(): string;
 }
 
@@ -73,13 +48,19 @@ export interface IdGenerator {
  * ```typescript
  * const mockFactory: SupabaseClientFactory = {
  *   create: (url, key) => mockSupabaseClient,
- *   createWithToken: (token) => mockSupabaseClientWithToken,
+ *   createWithToken: (url, publishableKey, token) => mockUserClient(token),
  * };
  * ```
  */
 export interface SupabaseClientFactory {
+  /** Create a client for an API key (publishable or secret) */
   create(url: string, key: string): SupabaseClient;
-  createWithToken(url: string, anonKey: string, token: string): SupabaseClient;
+  /** Create a user-scoped client (publishable key + the user's JWT) */
+  createWithToken(
+    url: string,
+    publishableKey: string,
+    token: string,
+  ): SupabaseClient;
 }
 
 /**
@@ -90,12 +71,17 @@ export interface SupabaseClientFactory {
  * ```typescript
  * const testEnv: EnvironmentProvider = {
  *   get: (key) => testEnvVars[key],
- *   require: (key) => testEnvVars[key] || throw new Error(),
+ *   require: (key) => {
+ *     if (!testEnvVars[key]) throw new Error(`${key} missing`);
+ *     return testEnvVars[key];
+ *   },
  * };
  * ```
  */
 export interface EnvironmentProvider {
+  /** Read a variable, or undefined when unset */
   get(key: string): string | undefined;
+  /** Read a variable, throwing when unset */
   require(key: string): string;
 }
 
@@ -126,12 +112,17 @@ export interface ServiceContainer {
   supabaseClientFactory: SupabaseClientFactory;
   /** Environment variable provider */
   env: EnvironmentProvider;
-  /** Get or create cached anonymous Supabase client (performance optimization) */
+  /** Get or create cached client for the publishable (or legacy anon) key */
   getOrCreateAnonClient: () => SupabaseClient;
-  /** Get or create cached service-role Supabase client */
+  /** Get or create cached admin client for the secret (or legacy service_role) key */
   getOrCreateServiceClient: () => SupabaseClient;
-  /** Get or create cached transaction pooler database client */
-  getOrCreateDbClient?: () => TransactionDbClient;
+  /**
+   * Get or create cached transaction pooler database client.
+   * May be async: the router awaits it.
+   */
+  getOrCreateDbClient?: () =>
+    | TransactionDbClient
+    | Promise<TransactionDbClient>;
 }
 
 /**
@@ -179,11 +170,71 @@ export const defaultEnv: EnvironmentProvider = {
   },
 };
 
+type KeyKind = "publishable" | "secret";
+
+const KEY_ERRORS: Record<KeyKind, string> = {
+  publishable:
+    "SUPABASE_URL and a publishable key (SUPABASE_PUBLISHABLE_KEYS, SUPABASE_PUBLISHABLE_KEY or legacy SUPABASE_ANON_KEY) required",
+  secret:
+    "SUPABASE_URL and a secret key (SUPABASE_SECRET_KEYS, SUPABASE_SECRET_KEY or legacy SUPABASE_SERVICE_ROLE_KEY) required",
+};
+
+/**
+ * Create a lazily-initialised Supabase client for the primary publishable or
+ * secret key. The client is cached per container and recreated if the
+ * resolved URL or key changes.
+ */
+const createCachedClientGetter = (
+  getContainer: () => ServiceContainer,
+  kind: KeyKind,
+): () => SupabaseClient => {
+  let cached: { client: SupabaseClient; url: string; key: string } | null =
+    null;
+
+  return () => {
+    const container = getContainer();
+    const keys = resolveSupabaseKeys(container.env);
+    const key = kind === "publishable"
+      ? keys.primaryPublishableKey
+      : keys.primarySecretKey;
+
+    if (!keys.url || !key) {
+      throw new Error(KEY_ERRORS[kind]);
+    }
+
+    if (cached?.url !== keys.url || cached.key !== key) {
+      cached = {
+        client: container.supabaseClientFactory.create(keys.url, key),
+        url: keys.url,
+        key,
+      };
+    }
+
+    return cached.client;
+  };
+};
+
+/** Marks getters created by createContainer (bound to their container) */
+const BUILT_IN_GETTER = Symbol("supabase-router.builtInGetter");
+
+const markBuiltIn = <T extends object>(getter: T): T =>
+  Object.assign(getter, { [BUILT_IN_GETTER]: true });
+
+/**
+ * Keep a user-provided getter, but never a built-in one copied from another
+ * container: it would keep reading that container's env and factory.
+ */
+const pickFunction = <T>(value: unknown, fallback: T): T =>
+  typeof value === "function" &&
+    !(value as { [BUILT_IN_GETTER]?: boolean })[BUILT_IN_GETTER]
+    ? value as T
+    : fallback;
+
 /**
  * Create a service container with defaults and optional overrides
  *
- * Performance: Includes module-level cached Supabase clients to avoid
- * creating new clients on every request (5-8ms overhead per request).
+ * Performance: Supabase clients are created lazily and cached per container
+ * to avoid creating new clients on every request (5-8ms overhead per request).
  *
  * **Serverless Environment Notes:**
  * - Cache works within a single warm instance (reused across multiple requests)
@@ -208,134 +259,37 @@ export const defaultEnv: EnvironmentProvider = {
  * const container = createContainer({
  *   logger: customLogger,
  * });
- *
- * // Add custom services
- * const container = createContainer({
- *   emailService: new EmailService(),
- *   paymentService: new PaymentService(),
- * });
  * ```
  */
-export function createContainer<
-  TOverrides extends Record<string, unknown> = Record<string, never>,
->(
-  overrides?:
-    & Partial<ServiceContainer>
-    & TOverrides
-    & Record<string, unknown>,
+export function createContainer<TOverrides extends object = object>(
+  overrides?: Partial<ServiceContainer> & TOverrides,
 ): ServiceContainer & TOverrides {
+  const provided: Partial<ServiceContainer> = overrides ?? {};
 
-  const providedOverrides = (overrides ?? {}) as
-    & Partial<ServiceContainer>
-    & TOverrides
-    & Record<string, unknown>;
+  if (
+    provided.getOrCreateDbClient !== undefined &&
+    typeof provided.getOrCreateDbClient !== "function"
+  ) {
+    throw new Error("getOrCreateDbClient override must be a function");
+  }
 
   const container = {
     logger: defaultLogger,
     idGenerator: defaultIdGenerator,
     supabaseClientFactory: defaultSupabaseClientFactory,
     env: defaultEnv,
-    getOrCreateAnonClient: providedOverrides.getOrCreateAnonClient ??
-      (() => {
-        throw new Error(
-          "SUPABASE_URL and SUPABASE_ANON_KEY required",
-        );
-      }),
-    getOrCreateServiceClient: providedOverrides.getOrCreateServiceClient ??
-      (() => {
-        throw new Error(
-          "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY required",
-        );
-      }),
-    getOrCreateDbClient: providedOverrides.getOrCreateDbClient,
-    ...providedOverrides,
+    ...provided,
   } as ServiceContainer & TOverrides;
 
-  // Add helper method for cached anon client
-  // Uses module-level cache (shared across all container instances in same module)
-  const getOrCreateAnonClient = (): SupabaseClient => {
-    const url = container.env.get("SUPABASE_URL");
-    const anonKey = container.env.get("SUPABASE_ANON_KEY");
-
-    if (!url || !anonKey) {
-      throw new Error(
-        "SUPABASE_URL and SUPABASE_ANON_KEY required",
-      );
-    }
-
-    // Return cached client if same URL and key (performance optimization)
-    // Cache is module-level, shared across all container instances
-    if (
-      moduleCachedAnonClient &&
-      moduleCachedAnonUrl === url &&
-      moduleCachedAnonKey === anonKey
-    ) {
-      return moduleCachedAnonClient;
-    }
-
-    // Create and cache new client at module level
-    moduleCachedAnonClient = container.supabaseClientFactory.create(
-      url,
-      anonKey,
-    );
-    moduleCachedAnonUrl = url;
-    moduleCachedAnonKey = anonKey;
-
-    return moduleCachedAnonClient;
-  };
-
-  const getOrCreateServiceClient = (): SupabaseClient => {
-    const url = container.env.get("SUPABASE_URL");
-    const serviceKey = container.env.get("SUPABASE_SERVICE_ROLE_KEY");
-
-    if (!url || !serviceKey) {
-      throw new Error(
-        "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY required",
-      );
-    }
-
-    // Return cached client if same URL and key
-    // Cache is module-level, shared across all container instances
-    if (
-      moduleCachedServiceClient &&
-      moduleCachedServiceUrl === url &&
-      moduleCachedServiceKey === serviceKey
-    ) {
-      return moduleCachedServiceClient;
-    }
-
-    // Create and cache new client at module level
-    moduleCachedServiceClient = container.supabaseClientFactory.create(
-      url,
-      serviceKey,
-    );
-    moduleCachedServiceUrl = url;
-    moduleCachedServiceKey = serviceKey;
-
-    return moduleCachedServiceClient;
-  };
-
-  if (
-    !("getOrCreateAnonClient" in providedOverrides) ||
-    typeof providedOverrides.getOrCreateAnonClient !== "function"
-  ) {
-    container.getOrCreateAnonClient = getOrCreateAnonClient;
-  }
-
-  if (
-    !("getOrCreateServiceClient" in providedOverrides) ||
-    typeof providedOverrides.getOrCreateServiceClient !== "function"
-  ) {
-    container.getOrCreateServiceClient = getOrCreateServiceClient;
-  }
-
-  if (
-    "getOrCreateDbClient" in providedOverrides &&
-    providedOverrides.getOrCreateDbClient &&
-    typeof providedOverrides.getOrCreateDbClient !== "function"
-  ) {
-    throw new Error("getOrCreateDbClient override must be a function");
-  }
+  const self = () => container;
+  container.getOrCreateAnonClient = pickFunction(
+    provided.getOrCreateAnonClient,
+    markBuiltIn(createCachedClientGetter(self, "publishable")),
+  );
+  container.getOrCreateServiceClient = pickFunction(
+    provided.getOrCreateServiceClient,
+    markBuiltIn(createCachedClientGetter(self, "secret")),
+  );
 
   return container;
 }

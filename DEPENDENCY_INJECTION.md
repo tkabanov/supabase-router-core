@@ -31,17 +31,35 @@ code more testable and maintainable.
 The container holds all your services and provides them to route handlers:
 
 ```typescript
-import { createContainer, ServiceContainer } from '@supabase-router/core';
+import { createContainer, defineRouter } from "@supabase-router/core";
 
 // Create container with default services
 const container = createContainer();
 
 // Pass to router
 const router = defineRouter({
+  basePath: "/api",
   container,
-  routes: [...]
+  routes: [/* ... */],
 });
 ```
+
+`createContainer(overrides)` fills in every built-in service you do not
+provide. Pass all overrides and custom services **to `createContainer`**:
+
+```typescript
+const container = createContainer({
+  logger: customLogger, // override a built-in service
+  emailService: new SendGridService(apiKey), // add a custom service
+});
+```
+
+> **Pass overrides to `createContainer`** instead of spreading a container
+> (`{ ...createContainer(), env: testEnv }`). A plain spread copies the built-in
+> `getOrCreateAnonClient` / `getOrCreateServiceClient`, which still read the
+> original container's `env` and `supabaseClientFactory`. `createContainer` (and
+> `defineRouter`, which calls it) rebinds them, so a spread object only behaves
+> correctly once it has gone through one of those.
 
 ### Accessing Services
 
@@ -49,6 +67,8 @@ Services are available in every route handler via the `services` property:
 
 ```typescript
 defineRoute({
+  method: "GET",
+  path: "/ids",
   handler: async ({ services }) => {
     services.logger.log("Processing request");
     const id = services.idGenerator.generate();
@@ -67,6 +87,8 @@ Logging functionality for debugging and monitoring:
 
 ```typescript
 defineRoute({
+  method: "POST",
+  path: "/login",
   handler: async ({ services }) => {
     // Log informational message
     services.logger.log("User login attempt", "userId:", "123");
@@ -75,7 +97,7 @@ defineRoute({
     services.logger.warn("Rate limit approaching", "current:", 95);
 
     // Log error
-    services.logger.error("Database connection failed", err);
+    services.logger.error("Database connection failed", new Error("timeout"));
 
     return { success: true };
   },
@@ -86,9 +108,9 @@ defineRoute({
 
 ```typescript
 interface Logger {
-  log: (message: string, ...args: unknown[]) => void;
-  error: (message: string, ...args: unknown[]) => void;
-  warn: (message: string, ...args: unknown[]) => void;
+  log(message: string, ...args: unknown[]): void;
+  error(message: string, ...args: unknown[]): void;
+  warn(message: string, ...args: unknown[]): void;
 }
 ```
 
@@ -98,6 +120,8 @@ Generate unique identifiers:
 
 ```typescript
 defineRoute({
+  method: "POST",
+  path: "/items",
   handler: async ({ services }) => {
     // Generate UUID
     const id = services.idGenerator.generate();
@@ -111,7 +135,7 @@ defineRoute({
 
 ```typescript
 interface IdGenerator {
-  generate: () => string;
+  generate(): string;
 }
 ```
 
@@ -121,12 +145,14 @@ Access environment variables safely:
 
 ```typescript
 defineRoute({
+  method: "GET",
+  path: "/config",
   handler: async ({ services }) => {
     // Get environment variable
     const apiKey = services.env.get("API_KEY");
 
     // Get with default value
-    const timeout = services.env.get("TIMEOUT") || "30";
+    const timeout = services.env.get("TIMEOUT") ?? "30";
 
     // Require environment variable (throws if missing)
     const requiredKey = services.env.require("REQUIRED_KEY");
@@ -135,7 +161,7 @@ defineRoute({
       return badRequest("API_KEY not configured");
     }
 
-    return { success: true };
+    return { success: true, timeout, hasKey: !!requiredKey };
   },
 });
 ```
@@ -144,37 +170,52 @@ defineRoute({
 
 ```typescript
 interface EnvironmentProvider {
-  get: (key: string) => string | undefined;
-  require: (key: string) => string; // Throws if key not found
+  get(key: string): string | undefined;
+  require(key: string): string; // Throws if key not found
 }
 ```
 
 ### 4. Supabase Client Factory
 
-Create Supabase clients (used internally by auth):
+Create Supabase clients (used internally by auth and the cached clients):
 
 ```typescript
 defineRoute({
-  handler: async ({ services, supabaseClient }) => {
+  method: "GET",
+  path: "/custom-client",
+  handler: async ({ services }) => {
     // Usually you'll use the auto-injected supabaseClient
     // But you can create custom clients if needed:
 
     // Create client with URL and key
     const customClient = services.supabaseClientFactory.create(
       "https://custom.supabase.co",
-      "custom-anon-key",
+      "sb_publishable_...",
     );
 
     // Create client with user token (for user-scoped access)
     const userClient = services.supabaseClientFactory.createWithToken(
       "https://custom.supabase.co",
-      "anon-key",
+      "sb_publishable_...",
       "user-access-token",
     );
 
-    return { success: true };
+    return { success: !!customClient && !!userClient };
   },
 });
+```
+
+**Interface:**
+
+```typescript
+interface SupabaseClientFactory {
+  create(url: string, key: string): SupabaseClient;
+  createWithToken(
+    url: string,
+    publishableKey: string,
+    token: string,
+  ): SupabaseClient;
+}
 ```
 
 ### 5. Cached Supabase Clients
@@ -183,65 +224,76 @@ The container provides cached client helpers for performance:
 
 ```typescript
 defineRoute({
+  method: "GET",
+  path: "/clients",
   handler: async ({ services }) => {
-    // Get or create cached anonymous client
-    // Automatically uses SUPABASE_URL and SUPABASE_ANON_KEY
+    // Cached client for the publishable key (respects RLS)
+    // (SUPABASE_PUBLISHABLE_KEYS → SUPABASE_PUBLISHABLE_KEY → legacy SUPABASE_ANON_KEY)
     const anonClient = services.getOrCreateAnonClient();
 
-    // Get or create cached service-role client
-    // Automatically uses SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
+    // Cached admin client for the secret key (bypasses RLS)
+    // (SUPABASE_SECRET_KEYS → SUPABASE_SECRET_KEY → legacy SUPABASE_SERVICE_ROLE_KEY)
     const serviceClient = services.getOrCreateServiceClient();
 
-    // Get or create database client (if transaction pooler enabled)
-    const dbClient = services.getOrCreateDbClient?.();
+    // Database client (only if the transaction pooler is enabled; may be async)
+    const dbClient = await services.getOrCreateDbClient?.();
 
-    return { success: true };
+    return { success: !!anonClient && !!serviceClient, hasDb: !!dbClient };
   },
 });
 ```
 
-**Note:** These methods cache clients at module level to avoid creating new clients on every request (5-8ms performance improvement).
+Both helpers read `SUPABASE_URL` and the keys through `services.env` and create
+clients with `services.supabaseClientFactory`, so overriding those two services
+in `createContainer` also changes the cached clients. They throw if the URL or
+key is missing.
+
+**Note:** Clients are cached **per container** (not globally) to avoid creating
+new clients on every request (5-8ms performance improvement). A cached client is
+recreated if the resolved URL or key changes.
 
 **Serverless Environment Behavior:**
-- ✅ **Warm instances**: Cache works across multiple requests within the same instance
-- ❌ **Cold starts**: Cache is reset when a new instance is initialized
-- 💡 **Best practice**: Create container at module level (not per-request) for maximum cache effectiveness
+
+- **Warm instances**: Cache works across multiple requests within the same
+  instance
+- **Cold starts**: Cache is reset when a new instance is initialized
+- **Best practice**: Create the container once at module level (not
+  per-request) so every request reuses the same cache
 
 ```typescript
-// ✅ Good - container created once at module level
-const container = createContainer({...});
-const router = defineRouter({ container, routes: [...] });
+// Good - container created once at module level
+const container = createContainer({ logger: customLogger });
+const router = defineRouter({ basePath: "/api", container, routes });
 
-// ❌ Bad - container created per request (cache doesn't help)
-Deno.serve(async (req) => {
-  const container = createContainer({...}); // New cache per request
-  // ...
+// Bad - container created per request (new cache every time)
+Deno.serve((req) => {
+  const container = createContainer({ logger: customLogger }); // New cache per request
+  return defineRouter({ basePath: "/api", container, routes }).handler(req);
 });
 ```
 
 ### 6. Database Client (Optional)
 
-If you enable the transaction pooler in your router configuration, the container provides a database client:
+If you enable the transaction pooler in your router configuration, the
+container provides a database client:
 
 ```typescript
 const router = defineRouter({
-  basePath: '/api',
+  basePath: "/api",
   database: {
     enableTransactionPooler: true,
-    connectionStringEnv: 'SUPABASE_DB_POOLER_URL',
+    connectionStringEnv: "SUPABASE_DB_POOLER_URL",
   },
   routes: [
     defineRoute({
-      method: 'POST',
-      path: '/data',
+      method: "POST",
+      path: "/data",
       useDatabase: true,
-      handler: async ({ db, services }) => {
+      handler: async ({ db }) => {
         // db is available when useDatabase: true
-        // You can also access it via services if needed
-        const dbClient = services.getOrCreateDbClient?.();
-        
-        if (!db || !dbClient) {
-          return { error: 'Database unavailable' };
+        // (also reachable via `await services.getOrCreateDbClient?.()`)
+        if (!db) {
+          return internalServerError("Database unavailable");
         }
 
         await db.transaction(async (tx) => {
@@ -255,28 +307,30 @@ const router = defineRouter({
 });
 ```
 
-**Note:** `getOrCreateDbClient` is optional (`?`) because it's only available when the transaction pooler is enabled.
-
-**Interface:**
-
-```typescript
-interface SupabaseClientFactory {
-  create: (url: string, key: string) => SupabaseClient;
-  createWithToken: (url: string, anonKey: string, token: string) => SupabaseClient;
-}
-```
+**Note:** `getOrCreateDbClient` is optional (`?`) because it's only available
+when the transaction pooler is enabled. It may return a promise, so always
+`await` it.
 
 ## Custom Services
 
 Extend the container with your own services:
 
-### Step 1: Define Service Interface
+### Step 1: Define Service Interfaces
 
 ```typescript
 // services/email.ts
 export interface EmailService {
   sendEmail(to: string, subject: string, body: string): Promise<void>;
-  sendTemplate(to: string, template: string, data: any): Promise<void>;
+  sendTemplate(
+    to: string,
+    template: string,
+    data: Record<string, unknown>,
+  ): Promise<void>;
+}
+
+// services/analytics.ts
+export interface AnalyticsService {
+  track(event: string, properties?: Record<string, unknown>): void;
 }
 ```
 
@@ -284,13 +338,12 @@ export interface EmailService {
 
 ```typescript
 // services/sendgrid.ts
-import { EmailService } from "./email.ts";
+import type { EmailService } from "./email.ts";
 
 export class SendGridService implements EmailService {
   constructor(private apiKey: string) {}
 
   async sendEmail(to: string, subject: string, body: string) {
-    // SendGrid implementation
     const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: {
@@ -310,7 +363,11 @@ export class SendGridService implements EmailService {
     }
   }
 
-  async sendTemplate(to: string, template: string, data: any) {
+  async sendTemplate(
+    to: string,
+    template: string,
+    data: Record<string, unknown>,
+  ) {
     // Template implementation
   }
 }
@@ -320,12 +377,12 @@ export class SendGridService implements EmailService {
 
 ```typescript
 // container.ts
-import { ServiceContainer } from "@supabase-router/core";
-import { EmailService } from "./services/email.ts";
+import type { ServiceContainer } from "@supabase-router/core";
+import type { EmailService } from "./services/email.ts";
+import type { AnalyticsService } from "./services/analytics.ts";
 
 export interface AppServices extends ServiceContainer {
   emailService: EmailService;
-  paymentService: PaymentService;
   analyticsService: AnalyticsService;
 }
 ```
@@ -337,54 +394,53 @@ export interface AppServices extends ServiceContainer {
 import { createContainer } from "@supabase-router/core";
 import { SendGridService } from "./services/sendgrid.ts";
 
-export const createAppContainer = (): AppServices => {
-  const baseContainer = createContainer();
-
-  return {
-    ...baseContainer,
-    emailService: new SendGridService(
-      Deno.env.get("SENDGRID_API_KEY")!,
-    ),
-    paymentService: new StripeService(
-      Deno.env.get("STRIPE_API_KEY")!,
-    ),
-    analyticsService: new AnalyticsService(),
-  };
-};
+export const createAppContainer = (): AppServices =>
+  createContainer({
+    emailService: new SendGridService(Deno.env.get("SENDGRID_API_KEY")!),
+    analyticsService: {
+      track: (event: string, properties?: Record<string, unknown>) =>
+        console.log(event, properties),
+    },
+  });
 ```
+
+`createContainer` returns `ServiceContainer & typeof overrides`, so it is
+assignable to `AppServices` without a cast. Annotate callback parameters in the
+overrides: the type is inferred from the argument, not from the return type.
 
 ### Step 5: Use in Routes
 
+Pass `AppServices` as the third generic of `defineRouter` and `services` is
+fully typed in every inline `defineRoute` (no casts needed):
+
 ```typescript
 import { defineRoute, defineRouter } from "@supabase-router/core";
-import { AppServices, createAppContainer } from "./container.ts";
+import { z } from "zod";
+import { type AppServices, createAppContainer } from "./container.ts";
 
-const router = defineRouter({
+const router = defineRouter<AppRole, AppUser, AppServices>({
   basePath: "/api",
   container: createAppContainer(),
   routes: [
     defineRoute({
       method: "POST",
       path: "/register",
+      authRequired: false, // routes are authenticated by default
       requestSchema: {
         body: z.object({
-          email: z.string().email(),
+          email: z.email(),
           name: z.string(),
         }),
       },
       handler: async ({ body, services }) => {
-        // Cast to access custom services
-        const appServices = services as AppServices;
-
-        // Use email service
-        await appServices.emailService.sendEmail(
+        // services.emailService is typed as EmailService
+        await services.emailService.sendEmail(
           body.email,
           "Welcome!",
           `Hello ${body.name}, welcome to our platform!`,
         );
 
-        // Use analytics service
-        appServices.analyticsService.track("user_registered", {
+        services.analyticsService.track("user_registered", {
           email: body.email,
         });
 
@@ -397,74 +453,149 @@ const router = defineRouter({
 
 ## Testing with DI
 
-The DI system makes testing incredibly easy:
+The DI system makes testing easy. Export a function that builds the router from
+a container, so tests can pass a container with mocks. Keep the routes inline
+in `defineRouter<..., AppServices>` so `services` stays typed:
+
+```typescript
+// app.ts
+export const createApp = (container: AppServices) =>
+  defineRouter<AppRole, AppUser, AppServices>({
+    basePath: "/api",
+    container,
+    routes: [
+      // the inline defineRoute(...) calls from Step 5
+    ],
+  });
+
+// index.ts
+Deno.serve(createApp(createAppContainer()).handler);
+```
 
 ### Basic Test Setup
 
 ```typescript
+import { assertEquals } from "@std/assert";
 import { createContainer } from "@supabase-router/core";
+import { createApp } from "./app.ts";
 
 Deno.test("registration - sends welcome email", async () => {
-  // Create test container with mock email service
-  const mockEmailService = {
-    sendEmail: async (to: string, subject: string, body: string) => {
-      // Track that email was sent
-      console.log(`Mock: Email to ${to}`);
+  const sent: string[] = [];
+
+  // Pass mocks to createContainer (never spread a container)
+  const testContainer = createContainer({
+    emailService: {
+      sendEmail: async (to: string) => {
+        sent.push(to);
+      },
+      sendTemplate: async () => {},
     },
-    sendTemplate: async () => {},
-  };
-
-  const testContainer = {
-    ...createContainer(),
-    emailService: mockEmailService,
-  };
-
-  const router = defineRouter({
-    container: testContainer,
-    routes: [registrationRoute],
+    analyticsService: { track: () => {} },
   });
 
-  const response = await router.handler(request);
+  const router = createApp(testContainer);
+
+  const response = await router.handler(
+    new Request("http://localhost/api/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "new@example.com", name: "New" }),
+    }),
+  );
+
   assertEquals(response.status, 200);
+  assertEquals(sent, ["new@example.com"]);
 });
 ```
+
+### Mocking Supabase and Auth
+
+Override `env` and `supabaseClientFactory` to control the cached clients and
+the default auth handler. The default handler verifies tokens with
+`auth.getClaims()` (it falls back to `auth.getUser()` when `getClaims` is
+missing, or with `tokenVerification: "auth-server"`), so mocks should implement
+`getClaims`:
+
+```typescript
+import type { SupabaseClient } from "@supabase-router/core";
+
+const mockClient = {
+  auth: {
+    getClaims: async (token: string) =>
+      token === "valid-token"
+        ? {
+          data: {
+            claims: {
+              sub: "user-123",
+              email: "test@example.com",
+              app_metadata: { role: "admin" },
+              user_metadata: { name: "Test User" },
+            },
+          },
+          error: null,
+        }
+        : { data: null, error: { message: "Invalid JWT" } },
+  },
+} as unknown as SupabaseClient;
+
+const testEnv: Record<string, string> = {
+  SUPABASE_URL: "http://localhost:54321",
+  SUPABASE_PUBLISHABLE_KEY: "sb_publishable_test",
+  SUPABASE_SECRET_KEY: "sb_secret_test",
+};
+
+const testContainer = createContainer({
+  emailService: mockEmailService,
+  analyticsService: { track: () => {} },
+  env: {
+    get: (key: string) => testEnv[key],
+    require: (key: string) => testEnv[key],
+  },
+  supabaseClientFactory: {
+    create: () => mockClient,
+    createWithToken: () => mockClient,
+  },
+});
+```
+
+The default auth handler builds `user` from `id`, `email` and the
+server-controlled `app_metadata` (e.g. `role`), or from your `userLoader`.
+Roles are never read from `user_metadata`, which users can edit themselves.
 
 ### Silent Logger for Tests
 
 ```typescript
 import { createContainer } from "@supabase-router/core";
 
-const createSilentTestContainer = () => ({
-  ...createContainer(),
-  logger: {
-    log: () => {},
-    error: () => {},
-    warn: () => {},
-  },
-});
+const createSilentTestContainer = () =>
+  createContainer({
+    logger: {
+      log: () => {},
+      error: () => {},
+      warn: () => {},
+    },
+  });
 ```
 
 ### Spy Pattern
 
 ```typescript
-Deno.test('tracks analytics event', async () => {
+Deno.test("tracks analytics event", async () => {
   let trackedEvent: string | null = null;
-  
-  const mockAnalytics = {
-    track: (event: string, data: any) => {
-      trackedEvent = event;
-    }
-  };
-  
-  const container = {
-    ...createContainer(),
-    analyticsService: mockAnalytics
-  };
-  
-  const router = defineRouter({ container, routes: [...] });
-  await router.handler(request);
-  
-  assertEquals(trackedEvent, 'user_registered');
+
+  const container = createContainer({
+    emailService: mockEmailService,
+    analyticsService: {
+      track: (event: string) => {
+        trackedEvent = event;
+      },
+    },
+  });
+
+  const router = createApp(container);
+  await router.handler(registerRequest);
+
+  assertEquals(trackedEvent, "user_registered");
 });
 ```
 
@@ -472,29 +603,31 @@ Deno.test('tracks analytics event', async () => {
 
 ### Lazy Initialization
 
-```typescript
-export const createAppContainer = (): AppServices => {
-  let emailService: EmailService | null = null;
+Containers are copied with object spread (by `createContainer` and again by
+`defineRouter`), so a `get` accessor on a service is evaluated immediately. For
+lazy initialization, expose a function instead:
 
-  return {
-    ...createContainer(),
-    get emailService() {
-      if (!emailService) {
-        emailService = new SendGridService(
-          Deno.env.get("SENDGRID_API_KEY")!,
-        );
-      }
-      return emailService;
-    },
-  };
-};
+```typescript
+interface LazyAppServices extends ServiceContainer {
+  getEmailService(): EmailService;
+}
+
+let emailService: EmailService | null = null;
+
+export const createLazyAppContainer = (): LazyAppServices =>
+  createContainer({
+    getEmailService: () =>
+      emailService ??= new SendGridService(Deno.env.get("SENDGRID_API_KEY")!),
+  });
+
+// In a handler: await services.getEmailService().sendEmail(...)
 ```
 
 ### Factory Pattern
 
 ```typescript
 interface DatabaseService {
-  getConnection(): Promise<Connection>;
+  getConnection(schema?: string): Promise<Connection>;
 }
 
 class DatabaseFactory implements DatabaseService {
@@ -522,7 +655,7 @@ class CompositeNotificationService {
 
   async notifyUser(userId: string, message: string) {
     await Promise.all([
-      this.email.send(userId, message),
+      this.email.sendEmail(userId, "Notification", message),
       this.sms.send(userId, message),
       this.push.send(userId, message),
     ]);
@@ -535,7 +668,7 @@ class CompositeNotificationService {
 ```typescript
 class CacheService {
   private static instance: CacheService;
-  private cache = new Map<string, any>();
+  private cache = new Map<string, unknown>();
 
   static getInstance() {
     if (!CacheService.instance) {
@@ -547,7 +680,7 @@ class CacheService {
   get(key: string) {
     return this.cache.get(key);
   }
-  set(key: string, value: any) {
+  set(key: string, value: unknown) {
     this.cache.set(key, value);
   }
 }
@@ -633,10 +766,10 @@ export const createAppContainer = (): AppServices => {
     throw new Error("SENDGRID_API_KEY is required");
   }
 
-  return {
-    ...createContainer(),
+  return createContainer({
     emailService: new SendGridService(apiKey),
-  };
+    analyticsService: new ConsoleAnalyticsService(),
+  });
 };
 ```
 
@@ -649,6 +782,7 @@ Use TypeScript to enforce correct service usage:
 interface AppServices extends ServiceContainer {
   emailService: EmailService; // Type-safe
 }
+defineRouter<AppRole, AppUser, AppServices>({ ... }); // typed `services`
 
 // Bad
 const services: any = { ... }; // Loses type safety
@@ -674,14 +808,14 @@ Complete example of a registration system with DI:
 
 ```typescript
 // services.ts
-import { createContainer, ServiceContainer } from "@supabase-router/core";
+import { createContainer, type ServiceContainer } from "@supabase-router/core";
 
 export interface EmailService {
   sendWelcomeEmail(email: string, name: string): Promise<void>;
 }
 
 export interface AnalyticsService {
-  trackEvent(event: string, properties: Record<string, any>): void;
+  trackEvent(event: string, properties: Record<string, unknown>): void;
 }
 
 export interface AppServices extends ServiceContainer {
@@ -690,87 +824,105 @@ export interface AppServices extends ServiceContainer {
 }
 
 // Production implementation
-export const createAppContainer = (): AppServices => ({
-  ...createContainer(),
-  emailService: {
-    sendWelcomeEmail: async (email, name) => {
-      // Real SendGrid implementation
+export const createAppContainer = (): AppServices =>
+  createContainer({
+    emailService: {
+      sendWelcomeEmail: async (email: string, name: string) => {
+        // Real SendGrid implementation
+      },
     },
-  },
-  analyticsService: {
-    trackEvent: (event, properties) => {
-      // Real analytics implementation
+    analyticsService: {
+      trackEvent: (event: string, properties: Record<string, unknown>) => {
+        // Real analytics implementation
+      },
     },
-  },
-});
+  });
 
 // Test implementation
-export const createTestContainer = (): AppServices => ({
-  ...createContainer(),
-  logger: {
-    log: () => {},
-    error: () => {},
-    warn: () => {},
-  },
-  emailService: {
-    sendWelcomeEmail: async () => {
-      console.log("Mock: Email sent");
+export const createTestContainer = (): AppServices =>
+  createContainer({
+    logger: {
+      log: () => {},
+      error: () => {},
+      warn: () => {},
     },
-  },
-  analyticsService: {
-    trackEvent: () => {
-      console.log("Mock: Event tracked");
+    emailService: {
+      sendWelcomeEmail: async () => {
+        console.log("Mock: Email sent");
+      },
     },
-  },
-});
+    analyticsService: {
+      trackEvent: () => {
+        console.log("Mock: Event tracked");
+      },
+    },
+  });
 
-// index.ts
-import { defineRoute, defineRouter } from "@supabase-router/core";
+// app.ts
+import {
+  badRequest,
+  defineRoute,
+  defineRouter,
+  internalServerError,
+} from "@supabase-router/core";
 import { z } from "zod";
-import { AppServices, createAppContainer } from "./services.ts";
+import { type AppServices, createAppContainer } from "./services.ts";
 
-const router = defineRouter({
-  basePath: "/api",
-  container: createAppContainer(),
-  routes: [
-    defineRoute({
-      method: "POST",
-      path: "/register",
-      requestSchema: {
-        body: z.object({
-          email: z.string().email(),
-          name: z.string(),
-          password: z.string().min(8),
-        }),
-      },
-      handler: async ({ body, services, supabaseClient }) => {
-        const appServices = services as AppServices;
+type AppRole = "admin" | "user";
 
-        // Create user
-        const { data: user, error } = await supabaseClient.auth.signUp({
-          email: body.email,
-          password: body.password,
-        });
+interface AppUser {
+  id: string;
+  email: string;
+  role?: AppRole; // from app_metadata or userLoader, never user_metadata
+}
 
-        if (error) throw error;
+export const createApp = (container: AppServices) =>
+  defineRouter<AppRole, AppUser, AppServices>({
+    basePath: "/api",
+    container,
+    routes: [
+      defineRoute({
+        method: "POST",
+        path: "/register",
+        authRequired: false, // public: no token required
+        requestSchema: {
+          body: z.object({
+            email: z.email(),
+            name: z.string(),
+            password: z.string().min(8),
+          }),
+        },
+        handler: async ({ body, services, supabaseClient }) => {
+          // Optional on public routes (set when SUPABASE_URL and a
+          // publishable key are configured)
+          if (!supabaseClient) {
+            return internalServerError("Supabase is not configured");
+          }
 
-        // Send welcome email
-        await appServices.emailService.sendWelcomeEmail(
-          body.email,
-          body.name,
-        );
+          const { data, error } = await supabaseClient.auth.signUp({
+            email: body.email,
+            password: body.password,
+          });
 
-        // Track analytics
-        appServices.analyticsService.trackEvent("user_registered", {
-          email: body.email,
-          timestamp: new Date().toISOString(),
-        });
+          if (error) {
+            return badRequest(error.message);
+          }
 
-        return { success: true, userId: user.user?.id };
-      },
-    }),
-  ],
-});
+          await services.emailService.sendWelcomeEmail(body.email, body.name);
+
+          services.analyticsService.trackEvent("user_registered", {
+            email: body.email,
+            timestamp: new Date().toISOString(),
+          });
+
+          return { success: true, userId: data.user?.id };
+        },
+      }),
+    ],
+  });
+
+// index.ts - container created once at module level
+const router = createApp(createAppContainer());
 
 if (import.meta.main) {
   Deno.serve(router.handler);

@@ -3,9 +3,9 @@
  * No custom authHandler needed - uses default implementation
  */
 
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import "@supabase/functions-js/edge-runtime.d.ts";
 import { defineRoute, defineRouter } from "../mod.ts";
-import { z } from "npm:zod";
+import { z } from "zod";
 
 // Simple role enum
 enum Roles {
@@ -13,7 +13,8 @@ enum Roles {
   USER = "user",
 }
 
-// User type (must match data in user_metadata)
+// User type: built from the token's app_metadata (server-controlled),
+// plus id and email. Use `userLoader` to load it from your own table instead.
 interface User {
   id: string;
   email: string;
@@ -31,9 +32,10 @@ const createPostSchema = z.object({
  *
  * Requirements:
  * - SUPABASE_URL environment variable
- * - SUPABASE_SERVICE_ROLE_KEY environment variable
- * - SUPABASE_ANON_KEY environment variable
- * - Users must have 'role' field in user_metadata
+ * - SUPABASE_PUBLISHABLE_KEYS (and SUPABASE_SECRET_KEYS for secret-key routes);
+ *   auto-provisioned in hosted Edge Functions. Legacy SUPABASE_ANON_KEY /
+ *   SUPABASE_SERVICE_ROLE_KEY still work until Supabase removes them.
+ * - Users must have 'role' in app_metadata (only the service role can set it)
  */
 export const router = defineRouter<Roles, User>({
   basePath: "/api",
@@ -103,8 +105,8 @@ export const router = defineRouter<Roles, User>({
       },
     }),
 
-    // Service role endpoint (internal use)
-    // ⚠️ WARNING: This endpoint requires service role key and should NEVER be called from frontend
+    // Secret-key endpoint (internal use)
+    // ⚠️ WARNING: This endpoint requires a secret key and should NEVER be called from frontend
     // Service role bypasses RLS and has full database access. Only use for internal operations.
     defineRoute({
       method: "POST",
@@ -116,8 +118,9 @@ export const router = defineRouter<Roles, User>({
         requireUserAuth: false,
       },
       handler: async ({ serviceRoleClient }) => {
-        // Only accessible with service role key
-        // Authorization: Bearer <SUPABASE_SERVICE_ROLE_KEY>
+        // Only accessible with a secret key:
+        //   apikey: sb_secret_...
+        // (legacy: Authorization: Bearer <service_role key>)
         // ⚠️ SECURITY: Never expose this endpoint to frontend code
 
         if (!serviceRoleClient) {
@@ -148,14 +151,18 @@ export const router = defineRouter<Roles, User>({
 /**
  * Usage:
  *
- * 1. Set environment variables:
+ * 1. Environment variables (auto-provisioned in hosted Edge Functions):
  *    SUPABASE_URL=https://xxx.supabase.co
- *    SUPABASE_SERVICE_ROLE_KEY=eyJhbGc...
- *    SUPABASE_ANON_KEY=eyJhbGc...
+ *    SUPABASE_PUBLISHABLE_KEYS={"default":"sb_publishable_..."}
+ *    SUPABASE_SECRET_KEYS={"default":"sb_secret_..."}
+ *    SUPABASE_JWKS={"keys":[...]}   (optional; enables local JWT verification)
+ *    In supabase/config.toml set `verify_jwt = false` for this function: the
+ *    router authenticates requests itself, and secret-key callers send no JWT.
  *
- * 2. Make sure users have 'role' in user_metadata:
- *    await supabase.auth.updateUser({
- *      data: { role: 'admin' }
+ * 2. Assign roles server-side via app_metadata (NOT user_metadata, which
+ *    every user can change for themselves with auth.updateUser):
+ *    await supabaseAdmin.auth.admin.updateUserById(userId, {
+ *      app_metadata: { role: 'admin' }
  *    })
  *
  * 3. Send requests with Bearer token:
@@ -166,10 +173,12 @@ if (import.meta.main) {
   console.log("Starting server with built-in Supabase authentication...");
   console.log("   Required env vars:");
   console.log("   - SUPABASE_URL");
-  console.log("   - SUPABASE_SERVICE_ROLE_KEY");
-  console.log("   - SUPABASE_ANON_KEY");
+  console.log("   - SUPABASE_PUBLISHABLE_KEYS (or legacy SUPABASE_ANON_KEY)");
+  console.log(
+    "   - SUPABASE_SECRET_KEYS (or legacy SUPABASE_SERVICE_ROLE_KEY)",
+  );
   console.log("");
-  console.log("   User metadata must include:");
+  console.log("   User app_metadata must include:");
   console.log('   - role: "admin" | "user"');
   Deno.serve(router.handler);
 }

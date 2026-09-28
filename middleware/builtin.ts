@@ -1,4 +1,4 @@
-import type { Middleware, MiddlewareContext } from "../core/types.ts";
+import type { Middleware } from "../core/types.ts";
 import { sanitizeErrorMessage } from "../security/sanitizer.ts";
 
 /**
@@ -29,12 +29,13 @@ export function loggingMiddleware<TUser = unknown>(options?: {
       services.logger.log("  Headers:", headers);
     }
 
+    const response = await next();
+    const duration = Date.now() - start;
+
+    // The body is parsed inside the pipeline, so it is only available after next()
     if (options?.logBody && ctx.body) {
       services.logger.log("  Body:", ctx.body);
     }
-
-    const response = await next();
-    const duration = Date.now() - start;
 
     services.logger.log(
       `← ${req.method} ${req.url} - ${response.status} (${duration}ms)`,
@@ -68,7 +69,8 @@ export function timingMiddleware<TUser = unknown>(): Middleware<TUser> {
 }
 
 /**
- * Request ID middleware - adds unique request ID to context and response
+ * Request ID middleware - exposes the request ID (the same one handlers see
+ * as `ctx.requestId`) in the `X-Request-Id` response header
  * @returns Request ID middleware
  *
  * @example
@@ -78,13 +80,8 @@ export function timingMiddleware<TUser = unknown>(): Middleware<TUser> {
  */
 export function requestIdMiddleware<TUser = unknown>(): Middleware<TUser> {
   return async (ctx, next) => {
-    const requestId = ctx.services.idGenerator.generate();
-
-    // Add to context (if not already set)
-    const contextWithRequestId = ctx as typeof ctx & { requestId?: string };
-    if (!contextWithRequestId.requestId) {
-      contextWithRequestId.requestId = requestId;
-    }
+    const requestId = ctx.requestId || ctx.services.idGenerator.generate();
+    ctx.requestId = requestId;
 
     const response = await next();
 
@@ -97,88 +94,11 @@ export function requestIdMiddleware<TUser = unknown>(): Middleware<TUser> {
 }
 
 /**
- * Rate limiting middleware (in-memory, simple implementation)
+ * Request timeout middleware.
  *
- * @deprecated FOR LOCAL DEVELOPMENT ONLY
+ * Note: JavaScript cannot cancel a running handler. The client gets a 408
+ * after `timeoutMs`, but the handler keeps running in the background.
  *
- * WARNING: This in-memory implementation DOES NOT WORK in serverless environments
- * with multiple instances (auto-scaling). Each instance maintains its own Map,
- * allowing rate limits to be bypassed when requests are distributed across instances.
- *
- * ISSUES:
- * - Memory leak: Map grows indefinitely without cleanup
- * - Not shared across instances: Rate limits are per-instance, not global
- * - OOM risk: Sustained load will exhaust memory
- *
- * FOR PRODUCTION USE:
- * - Cloudflare Rate Limiting (automatic, no code needed)
- * - Upstash Redis (see examples/redis-rate-limit.ts)
- * - Other distributed rate limiting solutions
- *
- * @param options - Rate limit options
- * @returns Rate limiting middleware
- *
- * @example Local development only
- * ```typescript
- * const middleware = rateLimitMiddleware({
- *   maxRequests: 100,
- *   windowMs: 60000 // 1 minute
- * });
- * ```
- *
- * @example Production with Redis
- * ```typescript
- * import { redisRateLimitMiddleware } from './examples/redis-rate-limit.ts';
- * const middleware = redisRateLimitMiddleware({
- *   redis: redisClient,
- *   maxRequests: 100,
- *   windowMs: 60000
- * });
- * ```
- */
-export function rateLimitMiddleware<TUser = unknown>(options: {
-  maxRequests: number;
-  windowMs: number;
-  keyFn?: (ctx: MiddlewareContext<TUser>) => string;
-}): Middleware<TUser> {
-  const requests = new Map<string, number[]>();
-
-  return async (ctx, next) => {
-    const key = options.keyFn
-      ? options.keyFn(ctx)
-      : ctx.req.headers.get("x-forwarded-for") || "unknown";
-    const now = Date.now();
-
-    // Get or create request timestamps for this key
-    let timestamps = requests.get(key) || [];
-
-    // Filter out old timestamps
-    timestamps = timestamps.filter((ts) => now - ts < options.windowMs);
-
-    // Check if rate limit exceeded
-    if (timestamps.length >= options.maxRequests) {
-      return new Response(
-        JSON.stringify({ error: "Rate limit exceeded" }),
-        {
-          status: 429,
-          headers: {
-            "Content-Type": "application/json",
-            "Retry-After": String(Math.ceil(options.windowMs / 1000)),
-          },
-        },
-      );
-    }
-
-    // Add current timestamp
-    timestamps.push(now);
-    requests.set(key, timestamps);
-
-    return await next();
-  };
-}
-
-/**
- * Request timeout middleware
  * @param timeoutMs - Timeout in milliseconds
  * @returns Timeout middleware
  *
@@ -191,7 +111,7 @@ export function timeoutMiddleware<TUser = unknown>(
   timeoutMs: number,
 ): Middleware<TUser> {
   return async (_ctx, next) => {
-    let timeoutId: number | undefined;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
     const timeoutPromise = new Promise<Response>((_, reject) => {
       timeoutId = setTimeout(() => {
@@ -239,9 +159,11 @@ export function bodySizeLimitMiddleware<TUser = unknown>(
   maxSize: number,
 ): Middleware<TUser> {
   return async (ctx, next) => {
-    const contentLength = ctx.req.headers.get("content-length");
+    const contentLength = Number(ctx.req.headers.get("content-length") ?? 0);
 
-    if (contentLength && parseInt(contentLength) > maxSize) {
+    // Chunked requests have no Content-Length; enforce limits at the platform
+    // level (Supabase/Deno Deploy) for those.
+    if (contentLength > maxSize) {
       return new Response(
         JSON.stringify({ error: "Request body too large" }),
         {
@@ -256,8 +178,11 @@ export function bodySizeLimitMiddleware<TUser = unknown>(
 }
 
 /**
- * Error handling middleware with sanitization
- * @param isDevelopment - Whether to include stack traces
+ * Error handling middleware. Logs the error via `services.logger`; clients
+ * only see the error message and stack trace in development, otherwise a
+ * generic message (internal details such as SQL or connection strings must
+ * not leak).
+ * @param isDevelopment - Whether to expose the message and stack trace
  * @returns Error handling middleware
  *
  * @example
@@ -278,16 +203,13 @@ export function errorHandlerMiddleware<TUser = unknown>(
         return error;
       }
 
-      const message = error instanceof Error
-        ? error.message
-        : "Internal server error";
-      const sanitized = sanitizeErrorMessage(message);
-
+      const details = isDevelopment && error instanceof Error;
       return new Response(
         JSON.stringify({
-          error: sanitized,
-          ...(isDevelopment && error instanceof Error &&
-            { stack: error.stack }),
+          error: details
+            ? sanitizeErrorMessage(error.message)
+            : "Internal server error",
+          ...(details && { stack: error.stack }),
         }),
         {
           status: 500,

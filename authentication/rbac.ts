@@ -12,7 +12,7 @@
  * ```typescript
  * enum Roles { ADMIN = 'admin', USER = 'user' }
  * checkRoles(Roles.ADMIN, [Roles.ADMIN, Roles.USER]); // true
- * checkRoles(Roles.GUEST, [Roles.ADMIN]); // false
+ * checkRoles(Roles.USER, [Roles.ADMIN]); // false
  * ```
  */
 export function checkRoles<TRole>(

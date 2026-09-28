@@ -25,7 +25,10 @@ export function composeMiddlewares<
     return async (_ctx, next) => await next();
   }
 
-  return (ctx: MiddlewareContext<TUser, TContainer>, last: Middleware<TUser, TContainer>) => {
+  return (
+    ctx: MiddlewareContext<TUser, TContainer>,
+    last: Middleware<TUser, TContainer>,
+  ) => {
     let index = -1;
 
     const dispatch = (i: number): Promise<Response> => {
@@ -52,9 +55,9 @@ export function composeMiddlewares<
  *
  * @example
  * ```typescript
- * const authIfNotPublic = conditionalMiddleware(
- *   (ctx) => !ctx.req.url.includes("/public"),
- *   authMiddleware
+ * const logWrites = conditionalMiddleware(
+ *   (ctx) => ctx.req.method !== "GET",
+ *   loggingMiddleware(),
  * );
  * ```
  */

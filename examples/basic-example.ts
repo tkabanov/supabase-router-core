@@ -2,10 +2,10 @@
  * Basic router example with simple role system
  */
 
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import "@supabase/functions-js/edge-runtime.d.ts";
 import { defineRoute, defineRouter } from "../mod.ts";
-import { z } from "npm:zod";
-import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
+import { z } from "zod";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 // Simple role enum
 enum BasicRoles {
@@ -102,7 +102,7 @@ export const router = defineRouter<BasicRoles, BasicUser>({
         body: createUserSchema,
       },
       responseSchema: userResponseSchema,
-      handler: ({ body, _user, _supabaseClient }) => {
+      handler: ({ body }) => {
         // body is typed as { email: string, name: string }
         // user is typed as BasicUser with role ADMIN
 

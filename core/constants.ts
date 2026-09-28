@@ -1,8 +1,9 @@
 /**
- * Default security headers to prevent common attacks
+ * Recommended security headers. They are NOT applied automatically: add them
+ * to responses yourself, e.g. in a global middleware.
  *
  * Security coverage:
- * - XSS protection via CSP and X-XSS-Protection
+ * - Content Security Policy; the legacy XSS auditor is explicitly disabled
  * - Clickjacking prevention via X-Frame-Options
  * - MIME sniffing prevention via X-Content-Type-Options
  * - HTTPS enforcement via HSTS
@@ -14,8 +15,8 @@ export const DEFAULT_SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
   /** Prevent clickjacking */
   "X-Frame-Options": "DENY",
-  /** Enable XSS protection in older browsers */
-  "X-XSS-Protection": "1; mode=block",
+  /** Disable the legacy XSS auditor, which itself caused vulnerabilities (OWASP) */
+  "X-XSS-Protection": "0",
   /** Enforce HTTPS with preload */
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
   /** Content Security Policy - restrict resource loading */
@@ -29,13 +30,17 @@ export const DEFAULT_SECURITY_HEADERS = {
 } as const;
 
 /**
- * Default CORS headers for permissive configuration
+ * Default CORS headers for permissive configuration.
+ *
+ * Allow-Headers covers everything supabase-js sends: `x-retry-count` on
+ * automatic retries (enabled by default) and the trace context headers when
+ * `tracePropagation` is on.
  */
 export const DEFAULT_CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
+    "authorization, x-client-info, apikey, content-type, x-retry-count, traceparent, tracestate, baggage",
   "Access-Control-Max-Age": "86400",
 } as const;
 
@@ -101,18 +106,34 @@ export const DEFAULT_SECURITY_SCHEMES = {
     bearerFormat: "JWT",
     description: "`Bearer {supabase_user_token}`. Supabase user access token.",
   },
+  supabaseSecretKey: {
+    type: "apiKey",
+    in: "header",
+    name: "apikey",
+    description:
+      "Supabase secret key (`sb_secret_...`). Server-to-server only; bypasses RLS.",
+  },
+  supabasePublishableKey: {
+    type: "apiKey",
+    in: "header",
+    name: "apikey",
+    description: "Supabase publishable key (`sb_publishable_...`).",
+  },
+  /** @deprecated Legacy service_role JWT; Supabase deprecates it by end of 2026 */
   supabaseServiceBearerAuth: {
     type: "http",
     scheme: "bearer",
     bearerFormat: "JWT",
     description:
-      "`Bearer {supabase_service_token}`. Supabase service role token.",
+      "Legacy: `Bearer {service_role_key}`. Deprecated by Supabase; use supabaseSecretKey.",
   },
+  /** @deprecated Legacy anon JWT; Supabase deprecates it by end of 2026 */
   supabaseAnonBearerAuth: {
     type: "http",
     scheme: "bearer",
     bearerFormat: "JWT",
-    description: "`Bearer {supabase_anon_token}`. Supabase anon role token.",
+    description:
+      "Legacy: `Bearer {anon_key}`. Deprecated by Supabase; use supabasePublishableKey.",
   },
 } as const;
 

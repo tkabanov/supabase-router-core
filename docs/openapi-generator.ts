@@ -1,15 +1,15 @@
 import type {
-  CompiledRoute,
+  AnyCompiledRoute,
+  BodySchema,
+  ErrorSchemaDefinition,
+  OpenAPIConfig,
   OpenAPIOperation,
   OpenAPISchema,
   ServiceContainer,
 } from "../core/types.ts";
 import type { CompiledRoutesData } from "../routing/compiler.ts";
-import {
-  extractSchema,
-  getGlobalSchemas,
-} from "../validation/schema-extractor.ts";
-import type { ZodTypeAny } from "npm:zod";
+import { extractSchema } from "../validation/schema-extractor.ts";
+import type { ZodTypeAny } from "zod";
 import { DEFAULT_SECURITY_SCHEMES } from "../core/constants.ts";
 
 interface OpenAPIRequestMedia {
@@ -24,15 +24,21 @@ interface OpenAPIRequestBody {
  * OpenAPI specification interface
  */
 export interface OpenAPISpec {
+  /** OpenAPI version */
   openapi: string;
+  /** Document metadata */
   info: {
     title: string;
     version: string;
     description?: string;
   };
+  /** Server list */
   servers?: Array<{ url: string; description?: string }>;
+  /** Tags used by operations */
   tags?: Array<{ name: string; description?: string }>;
+  /** Operations by path and method */
   paths: Record<string, Record<string, OpenAPIOperation>>;
+  /** Security schemes and shared schemas */
   components: {
     securitySchemes: Record<string, OpenAPISchema>;
     schemas: Record<string, OpenAPISchema>;
@@ -40,9 +46,137 @@ export interface OpenAPISpec {
 }
 
 interface SchemaObject {
-  properties?: Record<string, unknown>;
+  properties?: Record<string, OpenAPISchema>;
   required?: string[];
 }
+
+type Parameter = Record<string, unknown>;
+
+const toObjectSchema = (schema: ZodTypeAny): SchemaObject =>
+  (extractSchema(schema, "input") ?? {}) as SchemaObject;
+
+const buildQueryParameters = (schema: ZodTypeAny | undefined): Parameter[] => {
+  if (!schema) return [];
+  const { properties = {}, required = [] } = toObjectSchema(schema);
+  return Object.entries(properties).map(([name, def]) => ({
+    in: "query",
+    name,
+    required: required.includes(name),
+    schema: def,
+  }));
+};
+
+const buildPathParameters = (route: AnyCompiledRoute): Parameter[] => {
+  const properties = route.requestSchema?.params
+    ? toObjectSchema(route.requestSchema.params).properties ?? {}
+    : {};
+  // Every path template variable must be declared, with or without a schema
+  return route.params.map((name) => ({
+    in: "path",
+    name,
+    required: true,
+    schema: properties[name] ?? { type: "string" },
+  }));
+};
+
+const isMultiContentBody = (
+  body: BodySchema,
+): body is Record<string, ZodTypeAny> =>
+  typeof body === "object" && !("safeParse" in body);
+
+const buildRequestBody = (
+  body: BodySchema | undefined,
+): OpenAPIRequestBody | undefined => {
+  if (!body) return undefined;
+
+  const schemas = isMultiContentBody(body)
+    ? body
+    : { "application/json": body };
+  const content: Record<string, OpenAPIRequestMedia> = {};
+  for (const [contentType, schema] of Object.entries(schemas)) {
+    content[contentType] = { schema: extractSchema(schema, "input") ?? {} };
+  }
+  return { content };
+};
+
+const buildSuccessResponse = (route: AnyCompiledRoute): OpenAPISchema => {
+  if (!route.responseSchema) {
+    return { description: route.successResponseDescription ?? "OK" };
+  }
+  return {
+    description: route.successResponseDescription ?? "Success",
+    content: {
+      "application/json": {
+        schema: extractSchema(route.responseSchema, "output") ?? {},
+      },
+    },
+  };
+};
+
+const buildResponses = (
+  route: AnyCompiledRoute,
+): Record<number, OpenAPISchema> => {
+  const responses: Record<number, OpenAPISchema> = {
+    [route.successResponseCode ?? 200]: buildSuccessResponse(route),
+  };
+
+  const errorSchemas: Record<number, ErrorSchemaDefinition> =
+    route.errorSchemas ?? {};
+  for (const [code, errorDef] of Object.entries(errorSchemas)) {
+    responses[Number(code)] = {
+      description: errorDef.name || `Error ${code}`,
+      content: {
+        "application/json": {
+          schema: extractSchema(errorDef.schema, "output") ?? {},
+        },
+      },
+    };
+  }
+
+  return responses;
+};
+
+const buildAuthSecurity = (
+  route: AnyCompiledRoute,
+): Array<Record<string, string[]>> => {
+  const auth = route.authentication ?? {};
+  if (auth.requireServiceRole) {
+    return [{ supabaseSecretKey: [] }];
+  }
+
+  // Alternatives: any one of these is sufficient
+  return [
+    { supabaseBearerAuth: [] },
+    ...(auth.bypassWithServiceRole ? [{ supabaseSecretKey: [] }] : []),
+    ...(auth.bypassWithAnonRole ? [{ supabasePublishableKey: [] }] : []),
+  ];
+};
+
+const buildSecurity = (
+  route: AnyCompiledRoute,
+): Array<Record<string, string[]>> | undefined => {
+  if (route.security) return route.security;
+  return route.authRequired === false ? undefined : buildAuthSecurity(route);
+};
+
+const buildOperation = (route: AnyCompiledRoute): OpenAPIOperation => {
+  const parameters = [
+    ...buildPathParameters(route),
+    ...buildQueryParameters(route.requestSchema?.query),
+  ];
+  const requestBody = buildRequestBody(route.requestSchema?.body);
+  const security = buildSecurity(route);
+
+  return {
+    summary: route.summary,
+    description: route.description,
+    tags: route.tags,
+    ...(parameters.length > 0 && { parameters }),
+    ...(requestBody && { requestBody }),
+    responses: buildResponses(route),
+    ...(security && { security }),
+  };
+};
 
 /**
  * Generate OpenAPI paths from compiled routes
@@ -61,148 +195,17 @@ export function generateOpenAPIPaths<
   TContainer extends ServiceContainer = ServiceContainer,
 >(
   data:
-    // deno-lint-ignore no-explicit-any
-    | Array<CompiledRoute<TRole, TUser, any, any, any, boolean, TContainer>>
+    | Array<AnyCompiledRoute<TRole, TUser, TContainer>>
     | CompiledRoutesData<TRole, TUser, TContainer>,
 ): Record<string, Record<string, OpenAPIOperation>> {
   const paths: Record<string, Record<string, OpenAPIOperation>> = {};
   const routes = Array.isArray(data) ? data : data.routes;
-  // Routes are already properly typed above
 
   for (const route of routes) {
     // Convert :param to {param} for OpenAPI
     const key = route.fullPath.replace(/:(\w+)/g, "{$1}");
-    const method = route.method.toLowerCase();
-
-    // Initialize path if not exists
     paths[key] ??= {};
-
-    // Build parameters
-    const parameters: Array<Record<string, unknown>> = [];
-
-    if (route.requestSchema?.query) {
-      const querySchema = extractSchema(
-        route.requestSchema.query,
-        "Query",
-      ) as SchemaObject;
-      const props = querySchema.properties ?? {};
-      const required = querySchema.required ?? [];
-
-      for (const [name, def] of Object.entries(props)) {
-        parameters.push({
-          in: "query",
-          name,
-          required: required.includes(name),
-          schema: def,
-        });
-      }
-    }
-
-    if (route.requestSchema?.params) {
-      const paramsSchema = extractSchema(
-        route.requestSchema.params,
-        "Params",
-      ) as SchemaObject;
-      for (const [name, def] of Object.entries(paramsSchema.properties ?? {})) {
-        parameters.push({
-          in: "path",
-          name,
-          required: true,
-          schema: def,
-        });
-      }
-    }
-
-    // Build request body
-    let requestBody: OpenAPIRequestBody | undefined;
-    if (route.requestSchema?.body) {
-      const bodySchema = route.requestSchema.body;
-
-      // Check if multi-content-type schema
-      const isMultiContentType = typeof bodySchema === "object" &&
-        !("safeParse" in bodySchema);
-
-      if (isMultiContentType) {
-        const contentTypeSchemas = bodySchema as Record<string, ZodTypeAny>;
-        const multiContentRequestBody: OpenAPIRequestBody = { content: {} };
-
-        for (
-          const [contentType, schema] of Object.entries(contentTypeSchemas)
-        ) {
-          multiContentRequestBody.content[contentType] = {
-            schema: extractSchema(schema, "RequestBody") ?? {},
-          };
-        }
-
-        requestBody = multiContentRequestBody;
-      } else {
-        requestBody = {
-          content: {
-            "application/json": {
-              schema: extractSchema(bodySchema as ZodTypeAny, "RequestBody") ??
-                {},
-            },
-          },
-        };
-      }
-    }
-
-    // Build responses
-    const successCode = route.successResponseCode ?? 200;
-    const responses: Record<number, OpenAPISchema> = {
-      [successCode]: route.responseSchema
-        ? {
-          description: route.successResponseDescription ?? "Success",
-          content: {
-            "application/json": {
-              schema: extractSchema(route.responseSchema, "ResponseBody") ?? {},
-            },
-          },
-        }
-        : {
-          description: route.successResponseDescription ?? "OK",
-        },
-    };
-
-    // Add error schemas
-    if (route.errorSchemas) {
-      for (const [code, errorDef] of Object.entries(route.errorSchemas)) {
-        const statusCode = Number(code);
-        const schema = typeof errorDef === "object" && errorDef !== null &&
-            "schema" in errorDef
-          ? (errorDef as { schema: ZodTypeAny }).schema
-          : errorDef;
-        const errorName =
-          typeof (errorDef as { name?: unknown }).name === "string"
-            ? String((errorDef as { name?: unknown }).name)
-            : `Error ${code}`;
-
-        responses[statusCode] = {
-          description: errorName,
-          content: {
-            "application/json": {
-              schema: extractSchema(schema as ZodTypeAny, `Error${code}`) ?? {},
-            },
-          },
-        };
-      }
-    }
-
-    // Determine security requirements
-    const security = route.security ??
-      (route.authRequired === false ? undefined : [{ supabaseBearerAuth: [] }]);
-
-    // Build operation object
-    const operation: OpenAPIOperation = {
-      summary: route.summary,
-      description: route.description,
-      tags: route.tags,
-      ...(parameters.length > 0 && { parameters }),
-      ...(requestBody && { requestBody }),
-      responses,
-      ...(security && { security }),
-    };
-    paths[key][method] = operation;
+    paths[key][route.method.toLowerCase()] = buildOperation(route);
   }
 
   return paths;
@@ -259,14 +262,9 @@ export function generateOpenAPISpec<
   TContainer extends ServiceContainer = ServiceContainer,
 >(
   data:
-    // deno-lint-ignore no-explicit-any
-    | Array<CompiledRoute<TRole, TUser, any, any, any, boolean, TContainer>>
+    | Array<AnyCompiledRoute<TRole, TUser, TContainer>>
     | CompiledRoutesData<TRole, TUser, TContainer>,
-  config: {
-    title?: string;
-    version?: string;
-    description?: string;
-    servers?: Array<{ url: string; description?: string }>;
+  config: OpenAPIConfig & {
     securitySchemes?: Record<string, OpenAPISchema>;
   } = {},
 ): OpenAPISpec {
@@ -289,7 +287,8 @@ export function generateOpenAPISpec<
     paths,
     components: {
       securitySchemes,
-      schemas: getGlobalSchemas(),
+      // Schemas are inlined per operation (see extractSchema)
+      schemas: {},
     },
   };
 }

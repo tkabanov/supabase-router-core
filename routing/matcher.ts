@@ -1,12 +1,12 @@
-import type { CompiledRoute, ServiceContainer } from '../core/types.ts';
-import type { CompiledRoutesData } from './compiler.ts';
+import type { AnyCompiledRoute, ServiceContainer } from "../core/types.ts";
+import type { CompiledRoutesData } from "./compiler.ts";
 
 /**
  * Find all routes that match a given pathname (for OPTIONS handling)
  * @param pathname - URL pathname
  * @param data - Compiled routes data (array or optimized structure)
  * @returns Array of matching routes
- * 
+ *
  * @example
  * ```typescript
  * const matches = findMatchingRoutes("/users/123", compiledRoutes);
@@ -14,19 +14,17 @@ import type { CompiledRoutesData } from './compiler.ts';
  * ```
  */
 export function findMatchingRoutes<
-	TRole = string,
-	TUser = unknown,
-	TContainer extends ServiceContainer = ServiceContainer,
+  TRole = string,
+  TUser = unknown,
+  TContainer extends ServiceContainer = ServiceContainer,
 >(
-	pathname: string,
-	data:
-		// deno-lint-ignore no-explicit-any
-		| Array<CompiledRoute<TRole, TUser, any, any, any, boolean, TContainer>>
-		| CompiledRoutesData<TRole, TUser, TContainer>,
-	// deno-lint-ignore no-explicit-any
-): Array<CompiledRoute<TRole, TUser, any, any, any, boolean, TContainer>> {
-	const routes = Array.isArray(data) ? data : data.routes;
-	return routes.filter((route) => route.regex.test(pathname));
+  pathname: string,
+  data:
+    | Array<AnyCompiledRoute<TRole, TUser, TContainer>>
+    | CompiledRoutesData<TRole, TUser, TContainer>,
+): Array<AnyCompiledRoute<TRole, TUser, TContainer>> {
+  const routes = Array.isArray(data) ? data : data.routes;
+  return routes.filter((route) => route.regex.test(pathname));
 }
 
 /**
@@ -34,7 +32,7 @@ export function findMatchingRoutes<
  * @param pathname - URL pathname
  * @param data - Compiled routes data (array or optimized structure)
  * @returns Array of allowed methods
- * 
+ *
  * @example
  * ```typescript
  * const methods = getAllowedMethods("/users/123", routes);
@@ -42,29 +40,22 @@ export function findMatchingRoutes<
  * ```
  */
 export function getAllowedMethods<
-	TRole = string,
-	TUser = unknown,
-	TContainer extends ServiceContainer = ServiceContainer,
+  TRole = string,
+  TUser = unknown,
+  TContainer extends ServiceContainer = ServiceContainer,
 >(
-	pathname: string,
-	data:
-		// deno-lint-ignore no-explicit-any
-		| Array<CompiledRoute<TRole, TUser, any, any, any, boolean, TContainer>>
-		| CompiledRoutesData<TRole, TUser, TContainer>,
+  pathname: string,
+  data:
+    | Array<AnyCompiledRoute<TRole, TUser, TContainer>>
+    | CompiledRoutesData<TRole, TUser, TContainer>,
 ): string[] {
-	const matches = findMatchingRoutes<TRole, TUser, TContainer>(pathname, data);
-	const methods = new Set(matches.map((r) => r.method));
+  const matches = findMatchingRoutes<TRole, TUser, TContainer>(pathname, data);
+  const methods = new Set(matches.map((r) => r.method));
 
-	// Always include OPTIONS if there are any matches
-	if (methods.size > 0) {
-		methods.add('OPTIONS');
-	}
+  // Always include OPTIONS if there are any matches
+  if (methods.size > 0) {
+    methods.add("OPTIONS");
+  }
 
-	return Array.from(methods);
+  return Array.from(methods);
 }
-
-
-
-
-
-

@@ -2,15 +2,10 @@
  * Advanced router example with hierarchical roles and middleware
  */
 
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import {
-  defineRoute,
-  defineRouter,
-  loggingMiddleware,
-  rateLimitMiddleware,
-} from "../mod.ts";
-import { z } from "npm:zod";
-import { sql } from "npm:drizzle-orm";
+import "@supabase/functions-js/edge-runtime.d.ts";
+import { defineRoute, defineRouter, loggingMiddleware } from "../mod.ts";
+import { z } from "zod";
+import { sql } from "drizzle-orm";
 import { createRoleHierarchy } from "../authentication/rbac.ts";
 
 const noopAsync = () => Promise.resolve();
@@ -101,10 +96,7 @@ export const router = defineRouter<AdvancedRoles, AdvancedUser>({
   // Global middlewares
   middlewares: [
     loggingMiddleware({ logBody: false }),
-    rateLimitMiddleware({
-      maxRequests: 1000,
-      windowMs: 60000, // 1000 requests per minute
-    }),
+    // Rate limiting: see examples/redis-rate-limit.ts
   ],
 
   // Advanced auth handler with role hierarchy
@@ -120,10 +112,13 @@ export const router = defineRouter<AdvancedRoles, AdvancedUser>({
       if (token !== "service_role_key") {
         return { response: new Response("Unauthorized", { status: 401 }) };
       }
-      return {};
+      // Mark the trusted bypass explicitly; otherwise the router rejects
+      // the request for lacking a user
+      return { serviceBypassed: true };
     }
 
-    if (options.requireUserAuth) {
+    // requireUserAuth defaults to true; only `false` makes the user optional
+    if (options.requireUserAuth !== false) {
       if (!token) {
         return { response: new Response("Unauthorized", { status: 401 }) };
       }

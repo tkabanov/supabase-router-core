@@ -1,6 +1,6 @@
 import { HTTP_STATUS } from "../core/constants.ts";
 import { sanitizeErrorMessage } from "../security/sanitizer.ts";
-import { z, type ZodTypeAny } from "npm:zod";
+import { z, type ZodTypeAny } from "zod";
 import type { ErrorSchemaDefinition } from "../core/types.ts";
 
 /**
@@ -276,7 +276,8 @@ export const DEFAULT_ERROR_SCHEMAS: Record<number, ErrorSchemaDefinition> = {
 >;
 
 /**
- * Create error response based on environment
+ * Create a 500 response based on environment: the error message and stack
+ * trace are only included in development; otherwise a generic message.
  * @param error - Error object
  * @param isDevelopment - Whether in development mode
  * @returns Error response
@@ -292,13 +293,9 @@ export function createErrorResponseByEnv(
   error: Error,
   isDevelopment: boolean,
 ): Response {
-  const sanitized = sanitizeErrorMessage(error.message);
-
-  const body = {
-    error: sanitized,
-    // Include stack trace only in development
-    ...(isDevelopment && { stack: error.stack }),
-  };
+  const body = isDevelopment
+    ? { error: sanitizeErrorMessage(error.message), stack: error.stack }
+    : { error: "Internal server error" };
 
   return new Response(JSON.stringify(body), {
     status: HTTP_STATUS.INTERNAL_SERVER_ERROR,

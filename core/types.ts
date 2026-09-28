@@ -1,7 +1,7 @@
-import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
-import type { DrizzleConfig } from "npm:drizzle-orm";
-import type { drizzle as drizzleFactory } from "npm:drizzle-orm/postgres-js";
-import type { TypeOf, ZodTypeAny } from "npm:zod";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DrizzleConfig } from "drizzle-orm";
+import type { drizzle as drizzleFactory } from "drizzle-orm/postgres-js";
+import type { TypeOf, ZodTypeAny } from "zod";
 import type { ServiceContainer } from "./container.ts";
 
 // Re-export ServiceContainer for convenience
@@ -12,16 +12,39 @@ export type { ServiceContainer } from "./container.ts";
  */
 export type OpenAPISchema = Record<string, unknown>;
 
-export interface OpenAPIOperation {
-  summary?: string;
+/**
+ * OpenAPI document metadata
+ */
+export interface OpenAPIConfig {
+  /** API title (default: "API Documentation" via `router.openapi()`) */
+  title?: string;
+  /** API version (default: "1.0.0") */
+  version?: string;
+  /** API description */
   description?: string;
+  /** Server list */
+  servers?: Array<{ url: string; description?: string }>;
+}
+
+/** OpenAPI operation object */
+export interface OpenAPIOperation {
+  /** Short summary */
+  summary?: string;
+  /** Long description */
+  description?: string;
+  /** Tags */
   tags?: string[];
+  /** Path and query parameters */
   parameters?: Array<Record<string, unknown>>;
+  /** Request body by media type */
   requestBody?: {
     content: Record<string, { schema: OpenAPISchema }>;
   };
+  /** Responses by status code */
   responses: Record<number | string, OpenAPISchema>;
+  /** Security requirements */
   security?: Array<Record<string, string[]>>;
+  /** Vendor extensions and other OpenAPI fields */
   [key: string]: unknown;
 }
 
@@ -46,27 +69,27 @@ export interface AuthOptions<TRole = string> {
   allowedMethods?: string[];
   /**
    * **SECURITY WARNING**: Require service role key authentication
-   * 
+   *
    * **NEVER use this for frontend-accessible endpoints!**
-   * 
+   *
    * The service role key bypasses Row Level Security (RLS) and grants **full database access**.
    * Exposing endpoints with `requireServiceRole: true` to frontend code is a **critical security vulnerability**.
-   * 
+   *
    * **Safe use cases:**
    * - Internal/admin operations (server-side only)
    * - Server-to-server communication
    * - Background jobs or cron tasks
    * - Edge Functions called by other services (not from browser)
-   * 
+   *
    * **Never use for:**
    * - Public API endpoints
    * - Frontend-accessible routes
    * - User-facing operations
-   * 
+   *
    * ** Alternative for frontend:**
    * Use `requireUserAuth: true` with `requireRBAC: true` and `allowedRoles` instead.
    * This maintains RLS and provides proper access control.
-   * 
+   *
    * @example
    * ```typescript
    * // WRONG - Never expose to frontend!
@@ -76,7 +99,7 @@ export interface AuthOptions<TRole = string> {
    *     // This bypasses RLS - DANGEROUS if called from browser!
    *   }
    * });
-   * 
+   *
    * // CORRECT - Use user auth with RBAC for frontend
    * defineRoute({
    *   authentication: {
@@ -93,9 +116,18 @@ export interface AuthOptions<TRole = string> {
   requireServiceRole?: boolean;
   /** Allow bypassing with service role key */
   bypassWithServiceRole?: boolean;
-  /** Allow bypassing with anon role key */
+  /**
+   * Accept the anon key instead of a user token.
+   *
+   * **SECURITY WARNING**: the anon key is public (it ships with every
+   * frontend), so this effectively makes the route public. RBAC still applies
+   * and therefore always rejects anon-key requests.
+   */
   bypassWithAnonRole?: boolean;
-  /** Require authenticated user */
+  /**
+   * Require an authenticated user (default: `true` for routes with
+   * `authRequired`). Set to `false` to accept a valid token without a user.
+   */
   requireUserAuth?: boolean;
   /** Enable role-based access control */
   requireRBAC?: boolean;
@@ -117,8 +149,10 @@ export interface AuthResult<TUser = unknown, TRole = string> {
   serviceRoleClient?: SupabaseClient;
   /** Authenticated user data */
   user?: TUser;
-  /** Whether service role bypass was used */
+  /** Whether the service role key was used (trusted, skips user/RBAC checks) */
   serviceBypassed?: boolean;
+  /** Whether the public anon key was accepted instead of a user token */
+  anonBypassed?: boolean;
 }
 
 /**
@@ -176,6 +210,18 @@ export interface AuthenticatedContext<TUser = unknown> {
 }
 
 /**
+ * Context for public routes (`authRequired: false`)
+ */
+export interface PublicContext {
+  /** Never set on public routes */
+  user?: undefined;
+  /** Never set on public routes */
+  serviceRoleClient?: undefined;
+  /** Client for the publishable (or legacy anon) key, when configured */
+  supabaseClient?: SupabaseClient;
+}
+
+/**
  * Generic route context with full type inference
  * @template TParams - Path parameters type
  * @template TQuery - Query parameters type
@@ -227,8 +273,7 @@ export type RouteContext<
     /** Optional Drizzle database client (transaction pooler) */
     db?: TransactionDbClient;
   }
-  & (TAuth extends true ? AuthenticatedContext<TUser>
-    : Record<PropertyKey, never>);
+  & (TAuth extends true ? AuthenticatedContext<TUser> : PublicContext);
 
 /**
  * Middleware context type
@@ -239,10 +284,15 @@ export interface MiddlewareContext<
   TUser = unknown,
   TContainer extends ServiceContainer = ServiceContainer,
 > {
+  /** Original Request object */
   req: Request;
-  params: Record<string, string>;
+  /** Request ID for tracing */
+  requestId: string;
+  /** Path parameters (validated output once validation ran) */
+  params: Record<string, unknown>;
+  /** Query parameters (validated output once validation ran) */
   query: Record<string, unknown>;
-  /** Parsed body according to Content‑Type */
+  /** Parsed body according to Content‑Type (set after validation) */
   body: unknown;
   /** Service container with core and custom services */
   services: TContainer;
@@ -283,20 +333,26 @@ export type Middleware<
  * Request schema definition
  */
 export interface RouteSchemaDefinition {
+  /** Path parameters schema */
   params?: ZodTypeAny;
+  /** Query parameters schema */
   query?: ZodTypeAny;
+  /** Request body schema (single or per content type) */
   body?: BodySchema;
 }
 
-type InferParamsFromSchema<TSchema> = TSchema extends { params: infer P }
+/** Path params type inferred from a request schema */
+export type InferParamsFromSchema<TSchema> = TSchema extends { params: infer P }
   ? P extends ZodTypeAny ? TypeOf<P> : Record<string, string>
   : Record<string, string>;
 
-type InferQueryFromSchema<TSchema> = TSchema extends { query: infer Q }
+/** Query type inferred from a request schema */
+export type InferQueryFromSchema<TSchema> = TSchema extends { query: infer Q }
   ? Q extends ZodTypeAny ? TypeOf<Q> : Record<string, unknown>
   : Record<string, unknown>;
 
-type InferBodyFromSchema<TSchema> = TSchema extends { body: infer B }
+/** Body type inferred from a request schema */
+export type InferBodyFromSchema<TSchema> = TSchema extends { body: infer B }
   ? B extends ZodTypeAny ? TypeOf<B>
   : B extends Record<string, ZodTypeAny> ? {
       [K in keyof B]: TypeOf<B[K]>;
@@ -304,11 +360,15 @@ type InferBodyFromSchema<TSchema> = TSchema extends { body: infer B }
   : unknown
   : unknown;
 
-type InferAuthFromRoute<TRoute> = TRoute extends { authRequired: false }
+/** Whether a route definition requires auth */
+export type InferAuthFromRoute<TRoute> = TRoute extends { authRequired: false }
   ? false
   : true;
 
-type RouteHandler<
+/**
+ * Route handler receiving the fully typed route context
+ */
+export type RouteHandler<
   TParams,
   TQuery,
   TBody,
@@ -332,27 +392,33 @@ export type RouteDefinitionInput<
   TQuery = InferQueryFromSchema<TSchema>,
   TBody = InferBodyFromSchema<TSchema>,
   TContainer extends ServiceContainer = ServiceContainer,
-> = Omit<
-  RouteDef<TRole, TUser, TParams, TQuery, TBody, TAuth, TContainer>,
-  "fullPath" | "path" | "requestSchema" | "authRequired"
-> & {
-  path: string;
-  requestSchema?: TSchema;
-  authRequired?: TAuth;
-};
+> =
+  & Omit<
+    RouteDef<TRole, TUser, TParams, TQuery, TBody, TAuth, TContainer>,
+    "fullPath" | "path" | "requestSchema" | "authRequired"
+  >
+  & {
+    path: string;
+    requestSchema?: TSchema;
+    authRequired?: TAuth;
+  };
 
+/** Handler `params` type for a request schema */
 export type RouteParamsOf<
   TSchema extends RouteSchemaDefinition | undefined,
 > = InferParamsFromSchema<TSchema>;
 
+/** Handler `query` type for a request schema */
 export type RouteQueryOf<
   TSchema extends RouteSchemaDefinition | undefined,
 > = InferQueryFromSchema<TSchema>;
 
+/** Handler `body` type for a request schema */
 export type RouteBodyOf<
   TSchema extends RouteSchemaDefinition | undefined,
 > = InferBodyFromSchema<TSchema>;
 
+/** Whether a route definition requires auth */
 export type RouteAuthModeOf<TRoute> = InferAuthFromRoute<TRoute>;
 
 /**
@@ -364,8 +430,11 @@ export type BodySchema = ZodTypeAny | Record<string, ZodTypeAny>;
  * Error schema definition with typed throw helper
  */
 export interface ErrorSchemaDefinition {
+  /** Name used for the `throw<Name>` helper and OpenAPI description */
   name: string;
+  /** Response body schema */
   schema: ZodTypeAny;
+  /** Throw the error response */
   throw: (...args: unknown[]) => never;
 }
 
@@ -434,15 +503,18 @@ export interface RouteDef<
   authentication?: AuthOptions<TRole>;
   /** Shorthand for authentication.allowedRoles */
   allowedRoles?: TRole[];
-  /** CORS headers for OPTIONS requests */
-  corsHeaders?: Record<string, string>;
+  /** CORS configuration (overrides the router-level `corsHeaders`) */
+  corsHeaders?: CorsConfig | Record<string, string>;
   /** OpenAPI security requirements */
   security?: Array<Record<string, string[]>>;
   /** Route summary for OpenAPI */
   summary?: string;
   /** Route description for OpenAPI */
   description?: string;
-  /** Route-level middlewares */
+  /**
+   * Route-level middlewares. They run after authentication and validation,
+   * right before the handler, so `ctx.user` and `ctx.body` are available.
+   */
   middlewares?: Middleware<TUser, TContainer>[];
   /** Opt-in access to transaction pooler database client */
   useDatabase?: boolean;
@@ -507,26 +579,68 @@ export interface RouterConfig<
 > {
   /** Base path for all routes */
   basePath: string;
-  /** Default OpenAPI tags */
-  defaultTags: string[];
+  /** Default OpenAPI tags added to every route (default: none) */
+  defaultTags?: string[];
   /** Route definitions */
-  // deno-lint-ignore no-explicit-any
-  routes: Array<RouteDef<TRole, TUser, any, any, any, boolean, TContainer>>;
+  routes: Array<AnyRouteDef<TRole, TUser, TContainer>>;
   /** Custom authentication handler */
   authHandler?: AuthHandler<TRole, TUser>;
-  /** Custom user loader from database */
+  /**
+   * Load the user (including its role) from your database after the default
+   * auth handler verified the token. Without it, the user is built from the
+   * token's `app_metadata`, which only the server can modify.
+   * Ignored when a custom `authHandler` is provided.
+   */
   userLoader?: UserLoader<TUser>;
-  /** Global middlewares */
+  /**
+   * How the default auth handler verifies access tokens (default: `"claims"`,
+   * local JWKS verification). Use `"auth-server"` to detect signed-out
+   * sessions immediately. Ignored when a custom `authHandler` is provided.
+   */
+  tokenVerification?: "claims" | "auth-server";
+  /**
+   * Global middlewares. They wrap the whole request pipeline (right after route
+   * matching), so they run before authentication and body parsing: use them for
+   * rate limiting, body size limits, timeouts, logging and error handling.
+   * `ctx.user`/`ctx.body` are only populated after `await next()`.
+   */
   middlewares?: Middleware<TUser, TContainer>[];
   /** OpenAPI security schemes */
   securitySchemes?: Record<string, OpenAPISchema>;
-  /** Global CORS headers */
+  /** Global CORS configuration (default: permissive `*`) */
   corsHeaders?: CorsConfig | Record<string, string>;
+  /** OpenAPI document metadata */
+  openapi?: OpenAPIConfig;
   /** Service container for dependency injection */
   container?: Partial<TContainer> | TContainer;
   /** Transaction pooler database configuration */
   database?: RouterDatabaseConfig;
 }
+
+/**
+ * Type-erased slot. Routers hold routes whose params/query/body types differ,
+ * so collections of routes erase those generics. This is the only `any`.
+ */
+// deno-lint-ignore no-explicit-any
+export type Erased = any;
+
+/**
+ * Route definition with erased params/query/body/auth generics
+ */
+export type AnyRouteDef<
+  TRole = Erased,
+  TUser = Erased,
+  TContainer extends ServiceContainer = Erased,
+> = RouteDef<TRole, TUser, Erased, Erased, Erased, boolean, TContainer>;
+
+/**
+ * Compiled route with erased params/query/body/auth generics
+ */
+export type AnyCompiledRoute<
+  TRole = Erased,
+  TUser = Erased,
+  TContainer extends ServiceContainer = Erased,
+> = CompiledRoute<TRole, TUser, Erased, Erased, Erased, boolean, TContainer>;
 
 /**
  * Compiled route with regex pattern
@@ -567,11 +681,17 @@ export interface Router {
  * Security scheme definition for OpenAPI
  */
 export interface SecurityScheme {
+  /** Scheme type */
   type: "apiKey" | "http" | "oauth2" | "openIdConnect";
+  /** Description */
   description?: string;
+  /** Header, query or cookie name (apiKey) */
   name?: string;
+  /** Location of the API key (apiKey) */
   in?: "query" | "header" | "cookie";
+  /** HTTP auth scheme, e.g. `bearer` (http) */
   scheme?: string;
+  /** Bearer token format hint, e.g. `JWT` */
   bearerFormat?: string;
 }
 
@@ -587,16 +707,27 @@ export interface RouterDatabaseConfig {
   maxConnections?: number;
   /** Idle timeout in milliseconds */
   idleTimeoutMs?: number;
-  /** Statement timeout in milliseconds */
+  /**
+   * Statement timeout in milliseconds, sent as a connection startup parameter.
+   *
+   * Transaction poolers (Supabase Supavisor on port 6543, PgBouncer) silently
+   * drop startup parameters, so with them this has no effect; the router
+   * checks the effective value on connect and logs a warning. Set the timeout
+   * on the database role instead, which also works through the pooler:
+   * `ALTER ROLE postgres SET statement_timeout = '10s';`
+   * (use the role from your connection string).
+   */
   statementTimeoutMs?: number;
   /** Connection (socket) timeout in milliseconds */
   connectionTimeoutMs?: number;
-  /** Disable prepared statements (recommended for PgBouncer) */
+  /** Disable prepared statements (default: true; required by transaction poolers) */
   disablePreparedStatements?: boolean;
   /** Drizzle configuration overrides */
   drizzleConfig?: DrizzleConfig;
 }
 
-type DrizzleInstance = ReturnType<typeof drizzleFactory>;
+/** Drizzle client for postgres-js */
+export type DrizzleInstance = ReturnType<typeof drizzleFactory>;
 
+/** Drizzle client connected through the transaction pooler */
 export type TransactionDbClient = DrizzleInstance;

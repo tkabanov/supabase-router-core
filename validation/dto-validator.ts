@@ -1,13 +1,32 @@
-import type { TypeOf, ZodError, ZodTypeAny } from "npm:zod";
+import type { TypeOf, ZodError, ZodTypeAny } from "zod";
 import type { BodySchema } from "../core/types.ts";
+import { DANGEROUS_QUERY_KEYS } from "../core/constants.ts";
 import { parseFormDataSafely } from "../security/sanitizer.ts";
+
+const DANGEROUS_KEYS = new Set<string>(DANGEROUS_QUERY_KEYS);
+
+/**
+ * Extract the media type from a Content-Type header
+ * (`"Application/JSON; charset=utf-8"` -> `"application/json"`)
+ */
+const toMediaType = (contentType: string): string =>
+  contentType.split(";")[0].trim().toLowerCase();
+
+const jsonError = (status: number, body: unknown): Response =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 
 /**
  * Validation result
  */
 export interface ValidationResult<T = unknown> {
+  /** Whether validation passed */
   success: boolean;
+  /** Validated (parsed) data when successful */
   data?: T;
+  /** Validation errors when unsuccessful */
   errors?: Array<{
     path: string[];
     message: string;
@@ -24,7 +43,7 @@ export interface ValidationResult<T = unknown> {
  * const { error } = schema.safeParse(data);
  * if (error) {
  *   const formatted = beautifyZodErrors(error);
- *   return jsonResponse({ errors: formatted }, 400);
+ *   return badRequest("Validation failed", formatted);
  * }
  * ```
  */
@@ -63,16 +82,8 @@ export function validateDTO<TSchema extends ZodTypeAny>(
   const result = schema.safeParse(data);
 
   if (result.success) {
-    // Restore File objects that may have been lost during Zod parsing
     const validatedData = result.data as TypeOf<TSchema>;
-    if (
-      fileFields.size > 0 && typeof validatedData === "object" &&
-      validatedData !== null
-    ) {
-      for (const [key, fileValue] of fileFields) {
-        (validatedData as Record<string, unknown>)[key] = fileValue;
-      }
-    }
+    restoreFileFields(validatedData, fileFields);
 
     return {
       success: true,
@@ -84,6 +95,26 @@ export function validateDTO<TSchema extends ZodTypeAny>(
     success: false,
     errors: beautifyZodErrors(result.error),
   };
+}
+
+/**
+ * Restore File objects that Zod may have cloned, but only for keys the schema
+ * kept: fields stripped by the schema must stay stripped.
+ */
+function restoreFileFields(
+  validatedData: unknown,
+  fileFields: Map<string, File | Blob>,
+): void {
+  if (typeof validatedData !== "object" || validatedData === null) {
+    return;
+  }
+
+  const target = validatedData as Record<string, unknown>;
+  for (const [key, fileValue] of fileFields) {
+    if (Object.hasOwn(target, key)) {
+      target[key] = fileValue;
+    }
+  }
 }
 
 /**
@@ -105,46 +136,59 @@ function extractFileFields(data: unknown): Map<string, File | Blob> {
   return files;
 }
 
+const parseUrlEncoded = async (req: Request): Promise<unknown> => {
+  const params = new URLSearchParams(await req.text());
+  const result: Record<string, string> = Object.create(null);
+  params.forEach((value, key) => {
+    if (!DANGEROUS_KEYS.has(key)) {
+      result[key] = value;
+    }
+  });
+  return result;
+};
+
+const BODY_PARSERS: Record<string, (req: Request) => Promise<unknown>> = {
+  "application/json": (req) => req.json(),
+  "application/x-www-form-urlencoded": parseUrlEncoded,
+  "multipart/form-data": async (req) =>
+    parseFormDataSafely(await req.formData()),
+  "text/plain": (req) => req.text(),
+};
+
 /**
  * Parse request body based on content type
  * @param req - Request object
- * @param contentType - Content-Type header value
+ * @param mediaType - Media type (Content-Type without parameters)
  * @returns Parsed body
- *
- * @example
- * ```typescript
- * const body = await parseBodyByContentType(req, "application/json");
- * ```
  */
-async function parseBodyByContentType(
+async function parseBodyByMediaType(
   req: Request,
-  contentType: string,
+  mediaType: string,
 ): Promise<unknown> {
-  if (contentType.includes("application/json")) {
-    return await req.json();
+  const parser = BODY_PARSERS[mediaType];
+  if (!parser) {
+    throw jsonError(415, { error: "Unsupported Media Type" });
   }
-
-  if (contentType.includes("application/x-www-form-urlencoded")) {
-    const text = await req.text();
-    const params = new URLSearchParams(text);
-    const result: Record<string, string> = {};
-    params.forEach((value, key) => {
-      result[key] = value;
-    });
-    return result;
-  }
-
-  if (contentType.includes("multipart/form-data")) {
-    const formData = await req.formData();
-    return await parseFormDataSafely(formData);
-  }
-
-  if (contentType.includes("text/plain")) {
-    return await req.text();
-  }
-
-  throw new Error(`Unsupported content type: ${contentType}`);
+  return await parser(req);
 }
+
+const resolveBodySchema = (
+  bodySchema: BodySchema,
+  mediaType: string,
+  supportedContentTypes?: string[],
+): ZodTypeAny | undefined => {
+  // Multi-content-type schema: { "application/json": schema, ... }
+  if (typeof bodySchema === "object" && !("safeParse" in bodySchema)) {
+    const entry = Object.entries(bodySchema).find(([type]) =>
+      toMediaType(type) === mediaType
+    );
+    return entry?.[1];
+  }
+
+  const supported = !supportedContentTypes?.length ||
+    supportedContentTypes.some((type) => toMediaType(type) === mediaType);
+  return supported ? bodySchema as ZodTypeAny : undefined;
+};
 
 /**
  * Parse and validate request body
@@ -153,7 +197,7 @@ async function parseBodyByContentType(
  * @param contentType - Content-Type header
  * @param supportedContentTypes - Optional list of supported content types
  * @returns Validated body data
- * @throws Response with validation errors
+ * @throws Response with validation errors (400) or unsupported media type (415)
  *
  * @example
  * ```typescript
@@ -170,74 +214,30 @@ export async function parseAndValidateBody(
   contentType: string,
   supportedContentTypes?: string[],
 ): Promise<unknown> {
-  // Check if schema is multi-content-type
-  if (typeof bodySchema === "object" && !("safeParse" in bodySchema)) {
-    const contentTypeSchemas = bodySchema as Record<string, ZodTypeAny>;
-
-    // Find matching content type
-    for (
-      const [supportedType, typeSchema] of Object.entries(contentTypeSchemas)
-    ) {
-      if (contentType.includes(supportedType)) {
-        const rawBody = await parseBodyByContentType(req, contentType);
-        const result = validateDTO(rawBody, typeSchema);
-
-        if (!result.success) {
-          throw new Response(
-            JSON.stringify({
-              error: "Validation failed",
-              details: result.errors,
-            }),
-            {
-              status: 400,
-              headers: { "Content-Type": "application/json" },
-            },
-          );
-        }
-
-        return result.data;
-      }
-    }
-
-    // No matching content type found
-    throw new Response(
-      JSON.stringify({ error: "Unsupported Media Type" }),
-      {
-        status: 415,
-        headers: { "Content-Type": "application/json" },
-      },
-    );
+  const mediaType = toMediaType(contentType);
+  const schema = resolveBodySchema(
+    bodySchema,
+    mediaType,
+    supportedContentTypes,
+  );
+  if (!schema) {
+    throw jsonError(415, { error: "Unsupported Media Type" });
   }
 
-  // Single schema - validate supported content types
-  if (supportedContentTypes && supportedContentTypes.length > 0) {
-    const isSupported = supportedContentTypes.some((supportedType) =>
-      contentType.includes(supportedType)
-    );
-
-    if (!isSupported) {
-      throw new Response(
-        JSON.stringify({ error: "Unsupported Media Type" }),
-        {
-          status: 415,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
-    }
+  let rawBody: unknown;
+  try {
+    rawBody = await parseBodyByMediaType(req, mediaType);
+  } catch (error) {
+    if (error instanceof Response) throw error;
+    throw jsonError(400, { error: "Malformed request body" });
   }
 
-  // Parse and validate
-  const rawBody = await parseBodyByContentType(req, contentType);
-  const result = validateDTO(rawBody, bodySchema as ZodTypeAny);
-
+  const result = validateDTO(rawBody, schema);
   if (!result.success) {
-    throw new Response(
-      JSON.stringify({ error: "Validation failed", details: result.errors }),
-      {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      },
-    );
+    throw jsonError(400, {
+      error: "Validation failed",
+      details: result.errors,
+    });
   }
 
   return result.data;

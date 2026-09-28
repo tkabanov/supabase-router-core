@@ -5,10 +5,10 @@
  * for better testability and separation of concerns.
  */
 
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import "@supabase/functions-js/edge-runtime.d.ts";
 import { createContainer, defineRoute, defineRouter } from "../mod.ts";
 import type { ServiceContainer } from "../mod.ts";
-import { z } from "npm:zod";
+import { z } from "zod";
 
 // ============================================================================
 // 1. Define Custom Services

@@ -1,533 +1,387 @@
-# Testing Guide
+# Testing
 
-Comprehensive guide to testing your edge functions built with the router
-framework.
+How to test routers built with `@supabase-router/core`, and how the library
+tests itself.
 
 ## Table of Contents
 
-- [Running Tests](#running-tests)
-- [Test Structure](#test-structure)
-- [Writing Tests](#writing-tests)
-- [Test Helpers](#test-helpers)
-- [Database-Enabled Routes](#database-enabled-routes)
-- [Coverage](#coverage)
-- [Best Practices](#best-practices)
+- [Testing Your Routers](#testing-your-routers)
+- [The Library's Own Tests](#the-librarys-own-tests)
+- [Integration Tests (Real Supabase)](#integration-tests-real-supabase)
+- [Continuous Integration](#continuous-integration)
+- [Resources](#resources)
 
-## Running Tests
+## Testing Your Routers
 
-### Quick Start
+`router.handler` is a plain `(req: Request) => Promise<Response>` function, so
+routes can be tested in-process with `Deno.test`, without a server or a Supabase
+project. Replace the external dependencies through the service container:
 
-```bash
-# Run all tests
-deno task test
+- `env` - Supabase URL and keys (fake values are fine)
+- `supabaseClientFactory` - returns a fake Supabase client
+- `logger`, `idGenerator` - silent / deterministic
+- your own services (mailer, payments, ...)
 
-# Watch mode (auto-rerun on changes)
-deno task test:watch
+### Example
 
-# Run specific test category
-deno task test:unit
-deno task test:integration
-deno task test:e2e
-
-# With coverage
-deno task test:coverage
-
-# Generate coverage reports
-deno task coverage        # LCOV format
-deno task coverage:html   # HTML report
-```
-
-### Test Categories
-
-The router includes three types of tests:
-
-1. **Unit Tests** (70%) - Test individual modules in isolation
-2. **Integration Tests** (20%) - Test component interactions
-3. **E2E Tests** (10%) - Test complete workflows
-
-## Test Structure
-
-```
-__tests__/
-├── helpers/              # Reusable test utilities
-│   ├── mock-supabase.ts # Supabase client mock
-│   ├── test-containers.ts # DI container factories
-│   ├── request-builder.ts # HTTP request builder
-│   ├── test-utils.ts    # Assertion helpers
-│   └── fixtures.ts      # Test data
-├── unit/                 # Unit tests
-│   ├── security/        # Security module (CRITICAL)
-│   ├── authentication/  # Auth module (CRITICAL)
-│   ├── validation/      # Validation (CRITICAL)
-│   ├── routing/         # Route matching
-│   ├── middleware/      # Middleware
-│   ├── errors/          # Error handling
-│   ├── core/            # Core functionality
-│   └── docs/            # OpenAPI generation
-├── integration/          # Integration tests
-│   ├── router.test.ts
-│   ├── authentication-flow.test.ts
-│   └── di-container.test.ts
-└── e2e/                  # End-to-end tests
-    ├── crud-flow.test.ts
-    └── security-scenarios.test.ts
-```
-
-## Writing Tests
-
-### Unit Test Pattern
-
-Test individual functions in isolation:
+Keep the router in its own module so tests can pass a container:
 
 ```typescript
-import { assertEquals, assertRejects } from "jsr:@std/testing@0.224.0/asserts";
-import { sanitizePathParam } from "../../security/sanitizer.ts";
-
-Deno.test("sanitizePathParam - blocks path traversal", () => {
-  // Arrange
-  const maliciousInput = "../../../etc/passwd";
-
-  // Act & Assert
-  assertRejects(
-    () => sanitizePathParam(maliciousInput),
-    Error,
-    "Invalid path parameter",
-  );
-});
-
-Deno.test("sanitizePathParam - allows valid input", () => {
-  const validInput = "user-123";
-  const result = sanitizePathParam(validInput);
-  assertEquals(result, "user-123");
-});
-```
-
-### Integration Test Pattern
-
-Test multiple components working together:
-
-```typescript
-import { defineRoute, defineRouter } from "../../router.ts";
-import { createSilentTestContainer } from "../helpers/test-containers.ts";
+// supabase/functions/api/router.ts
+import {
+  defineRoute,
+  defineRouter,
+  type ServiceContainer,
+} from "@supabase-router/core";
 import { z } from "zod";
 
-Deno.test("Router - handles authenticated request", async () => {
-  // Arrange
-  const container = createSilentTestContainer();
-  const router = defineRouter({
-    container,
+export interface Mailer {
+  send(to: string, subject: string): Promise<void>;
+}
+
+export interface AppServices extends ServiceContainer {
+  mailer: Mailer;
+}
+
+interface User {
+  id: string;
+  email?: string;
+  role?: "admin" | "user";
+}
+
+export function createRouter(container?: Partial<AppServices>) {
+  return defineRouter<"admin" | "user", User, AppServices>({
     basePath: "/api",
+    container,
     routes: [
       defineRoute({
         method: "GET",
-        path: "/profile",
-        authRequired: true,
-        handler: async ({ user }) => {
-          return { userId: user.id };
+        path: "/me",
+        handler: ({ user }) =>
+          Promise.resolve({ id: user.id, role: user.role }),
+      }),
+      defineRoute({
+        method: "POST",
+        path: "/invite",
+        allowedRoles: ["admin"],
+        requestSchema: { body: z.object({ email: z.email() }) },
+        handler: async ({ body, services }) => {
+          await services.mailer.send(body.email, "You are invited");
+          return { invited: body.email };
         },
       }),
     ],
   });
-
-  // Act
-  const response = await router.handler(
-    new Request("http://localhost/api/profile", {
-      headers: { "Authorization": "Bearer valid-token" },
-    }),
-  );
-
-  // Assert
-  assertEquals(response.status, 200);
-  const body = await response.json();
-  assertEquals(body.userId, "test-user-id");
-});
+}
 ```
 
-### E2E Test Pattern
+`index.ts` then only does
+`Deno.serve(createRouter({ mailer: realMailer }).handler)`.
 
-Test complete user workflows:
-
-```typescript
-Deno.test("E2E - Complete CRUD workflow", async () => {
-  const container = createTestContainer();
-  const router = defineRouter({ container, routes: crudRoutes });
-
-  // Step 1: Create
-  const createReq = new Request("http://localhost/api/items", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer token",
-    },
-    body: JSON.stringify({ name: "Test Item" }),
-  });
-  const createRes = await router.handler(createReq);
-  assertEquals(createRes.status, 201);
-  const created = await createRes.json();
-
-  // Step 2: Read
-  const readReq = new Request(`http://localhost/api/items/${created.id}`);
-  const readRes = await router.handler(readReq);
-  assertEquals(readRes.status, 200);
-
-  // Step 3: Update
-  const updateReq = new Request(`http://localhost/api/items/${created.id}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer token",
-    },
-    body: JSON.stringify({ name: "Updated Item" }),
-  });
-  const updateRes = await router.handler(updateReq);
-  assertEquals(updateRes.status, 200);
-
-  // Step 4: Delete
-  const deleteReq = new Request(`http://localhost/api/items/${created.id}`, {
-    method: "DELETE",
-    headers: { "Authorization": "Bearer admin-token" },
-  });
-  const deleteRes = await router.handler(deleteReq);
-  assertEquals(deleteRes.status, 204);
-});
-```
-
-## Test Helpers
-
-### Mock Supabase Client
+The test fakes `auth.getClaims`, which the default auth handler uses to verify
+access tokens. The claims mirror a real Supabase access token: `sub`, `email`
+and `app_metadata` (where the role lives).
 
 ```typescript
-import { createMockSupabaseClient } from "../helpers/mock-supabase.ts";
+// supabase/functions/api/router_test.ts
+import { assertEquals } from "@std/assert";
+import { createContainer, type SupabaseClient } from "@supabase-router/core";
+import { type AppServices, createRouter } from "./router.ts";
 
-const mockClient = createMockSupabaseClient({
-  from: () => ({
-    select: () => ({ data: [{ id: 1 }], error: null }),
-    insert: () => ({ data: { id: 1 }, error: null }),
-  }),
-});
-```
-
-### Test Containers
-
-```typescript
-import {
-  createSilentTestContainer,
-  createTestContainer,
-} from "../helpers/test-containers.ts";
-
-// Silent logger for clean test output
-const silentContainer = createSilentTestContainer();
-
-// Full container with custom services
-const container = createTestContainer({
-  emailService: mockEmailService,
-});
-```
-
-### Request Builder
-
-```typescript
-import { RequestBuilder } from "../helpers/request-builder.ts";
-
-const request = new RequestBuilder()
-  .url("http://localhost/api/users")
-  .method("POST")
-  .json({ name: "John" })
-  .auth("Bearer token")
-  .build();
-```
-
-### Test Fixtures
-
-```typescript
-import { createTestItem, createTestUser } from "../helpers/fixtures.ts";
-
-const testUser = createTestUser({ role: "admin" });
-const testItem = createTestItem({ name: "Test" });
-```
-
-## Database-Enabled Routes
-
-Routes that opt into `useDatabase: true` expect a Drizzle client. Provide a mock
-through the container to avoid opening real connections:
-
-```typescript
-import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import { defineRoute, defineRouter } from "@router";
-import { assertEquals } from "jsr:@std/testing@0.224.0/asserts";
-
-const fakeDb = {
-  transaction: async <T>(
-    callback: (tx: PostgresJsDatabase) => Promise<T>,
-  ): Promise<T> => await callback(fakeDb as PostgresJsDatabase),
-  execute: async () => ({ rows: [] }),
-} as unknown as PostgresJsDatabase;
-
-const router = defineRouter({
-  basePath: "/api",
-  container: {
-    getOrCreateDbClient: () => fakeDb,
+// Tokens the fake Auth accepts, with the claims a real access token carries
+const TOKENS: Record<string, Record<string, unknown>> = {
+  "admin-token": {
+    sub: "u-admin",
+    email: "admin@example.com",
+    app_metadata: { role: "admin" },
   },
-  routes: [
-    defineRoute({
-      method: "POST",
-      path: "/db",
-      useDatabase: true,
-      handler: async ({ db }) => {
-        assertEquals(db, fakeDb);
-        return { ok: true };
-      },
-    }),
-  ],
-});
-```
-
-To test failure scenarios, omit the connection string (or point to an invalid
-value) and assert that the handler responds with `status === 500` and
-`error === "Database connection error"`.
-
-## Coverage
-
-### Coverage Targets
-
-| Module          | Target | Priority |
-| --------------- | ------ | -------- |
-| security/       | 95%+   | CRITICAL |
-| authentication/ | 90%+   | CRITICAL |
-| validation/     | 90%+   | CRITICAL |
-| routing/        | 85%+   | High     |
-| router.ts       | 85%+   | High     |
-| middleware/     | 80%+   | Medium   |
-
-### Generate Coverage Reports
-
-```bash
-# Run tests with coverage
-deno task test:coverage
-
-# Generate LCOV report
-deno task coverage
-
-# Generate HTML report (opens in browser)
-deno task coverage:html
-```
-
-### View Coverage
-
-```bash
-# Terminal output
-deno coverage coverage
-
-# HTML report
-open coverage/html/index.html
-```
-
-## Best Practices
-
-### 1. Test Naming
-
-Use descriptive names that explain what is being tested:
-
-```typescript
-// Bad
-Deno.test('test1', () => { ... });
-
-// Good
-Deno.test('sanitizePathParam - blocks path traversal attacks', () => { ... });
-```
-
-### 2. Arrange-Act-Assert Pattern
-
-```typescript
-Deno.test("example", async () => {
-  // Arrange: Set up test data and dependencies
-  const input = "test-input";
-  const expected = "test-output";
-
-  // Act: Execute the code being tested
-  const result = functionUnderTest(input);
-
-  // Assert: Verify the results
-  assertEquals(result, expected);
-});
-```
-
-### 3. Test One Thing
-
-Each test should verify one specific behavior:
-
-```typescript
-// Bad: Testing multiple things
-Deno.test('user operations', async () => {
-  await createUser();
-  await updateUser();
-  await deleteUser();
-});
-
-// Good: Separate tests
-Deno.test('createUser - creates user successfully', async () => { ... });
-Deno.test('updateUser - updates user successfully', async () => { ... });
-Deno.test('deleteUser - deletes user successfully', async () => { ... });
-```
-
-### 4. Use Test Containers
-
-Always use test containers for dependency injection:
-
-```typescript
-// Good: Using test container
-const container = createSilentTestContainer();
-const router = defineRouter({ container, routes: [...] });
-```
-
-### 5. Clean Up Resources
-
-```typescript
-Deno.test("resource test", async () => {
-  const resource = await createResource();
-
-  try {
-    // Test code
-  } finally {
-    await resource.cleanup();
-  }
-});
-```
-
-### 6. Test Error Cases
-
-Don't just test the happy path:
-
-```typescript
-Deno.test("handler - returns 400 for invalid input", async () => {
-  const response = await router.handler(invalidRequest);
-  assertEquals(response.status, 400);
-});
-
-Deno.test("handler - returns 401 for missing auth", async () => {
-  const response = await router.handler(unauthenticatedRequest);
-  assertEquals(response.status, 401);
-});
-```
-
-### 7. Mock External Dependencies
-
-```typescript
-const mockEmailService = {
-  sendEmail: async (to: string, subject: string) => {
-    // Mock implementation - don't send real emails in tests
-    console.log(`Mock: Email to ${to}`);
+  "user-token": {
+    sub: "u-user",
+    email: "user@example.com",
+    app_metadata: { role: "user" },
   },
 };
 
-const container = createTestContainer({
-  emailService: mockEmailService,
-});
-```
+// The default auth handler verifies tokens with auth.getClaims()
+const fakeSupabase = () =>
+  ({
+    auth: {
+      getClaims: (token: string) =>
+        Promise.resolve(
+          TOKENS[token]
+            ? { data: { claims: TOKENS[token] }, error: null }
+            : { data: null, error: new Error("invalid JWT") },
+        ),
+    },
+  }) as unknown as SupabaseClient;
 
-### 8. Use Fixtures for Complex Data
+const ENV: Record<string, string> = {
+  SUPABASE_URL: "http://localhost:54321",
+  SUPABASE_PUBLISHABLE_KEY: "sb_publishable_test",
+};
 
-```typescript
-// fixtures.ts
-export const createTestUser = (overrides = {}) => ({
-  id: "test-user-id",
-  email: "test@example.com",
-  role: "user",
-  ...overrides,
-});
+function setup() {
+  const sent: string[] = [];
+  const container = createContainer<Pick<AppServices, "mailer">>({
+    env: { get: (key) => ENV[key], require: (key) => ENV[key] },
+    logger: { log: () => {}, warn: () => {}, error: () => {} },
+    idGenerator: { generate: () => "req-1" },
+    supabaseClientFactory: {
+      create: () => fakeSupabase(),
+      createWithToken: () => fakeSupabase(),
+    },
+    mailer: {
+      send: (to) => {
+        sent.push(to);
+        return Promise.resolve();
+      },
+    },
+  });
+  return { router: createRouter(container), sent };
+}
 
-// test.ts
-const admin = createTestUser({ role: "admin" });
-const regularUser = createTestUser();
-```
-
-## Testing Your Application
-
-When building applications with the router:
-
-```typescript
-import { createSilentTestContainer } from "../_shared/router/__tests__/helpers/test-containers.ts";
-import { defineRoute, defineRouter } from "../_shared/router/mod.ts";
-
-Deno.test("my function - works correctly", async () => {
-  const router = defineRouter({
-    container: createSilentTestContainer(),
-    routes: [
-      // Your routes
-    ],
+const call = (path: string, token?: string, body?: unknown) =>
+  new Request(`http://localhost${path}`, {
+    method: body ? "POST" : "GET",
+    headers: {
+      ...(token && { Authorization: `Bearer ${token}` }),
+      ...(body !== undefined && { "Content-Type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
 
-  const response = await router.handler(request);
-  assertEquals(response.status, 200);
+Deno.test("GET /me returns the user from the token", async () => {
+  const { router } = setup();
+  const res = await router.handler(call("/api/me", "user-token"));
+  assertEquals(res.status, 200);
+  assertEquals(await res.json(), { id: "u-user", role: "user" });
+});
+
+Deno.test("missing and invalid tokens get 401", async () => {
+  const { router } = setup();
+  const missing = await router.handler(call("/api/me"));
+  assertEquals(missing.status, 401);
+  assertEquals(await missing.json(), {
+    error: "Authorization header required",
+  });
+
+  const invalid = await router.handler(call("/api/me", "nope"));
+  assertEquals(await invalid.json(), { error: "Invalid or expired token" });
+});
+
+Deno.test("only admins can invite", async () => {
+  const { router, sent } = setup();
+  const body = { email: "new@example.com" };
+
+  const denied = await router.handler(call("/api/invite", "user-token", body));
+  assertEquals(denied.status, 403);
+  await denied.body?.cancel();
+
+  const ok = await router.handler(call("/api/invite", "admin-token", body));
+  assertEquals(ok.status, 200);
+  assertEquals(sent, ["new@example.com"]);
+});
+
+Deno.test("invalid body is rejected with details", async () => {
+  const { router } = setup();
+  const res = await router.handler(
+    call("/api/invite", "admin-token", { email: "not-an-email" }),
+  );
+  assertEquals(res.status, 400);
+  const { error, details } = await res.json();
+  assertEquals(error, "Validation failed");
+  assertEquals(details[0].path, ["email"]);
 });
 ```
+
+Add `"@std/assert": "jsr:@std/assert@^1"` to your imports and run
+`deno test supabase/functions/api/`.
+
+### Tips
+
+- **`getUser` instead of `getClaims`.** If the fake client has no
+  `auth.getClaims`, or the router uses `tokenVerification: "auth-server"`, the
+  router calls `auth.getUser(token)` instead. Return
+  `{ data: { user: { id, email, app_metadata, user_metadata } }, error: null }`
+  for valid tokens and `{ data: { user: null }, error }` otherwise.
+- **Which client is used where.** `supabaseClientFactory.create(url, key)`
+  builds the anonymous client (token verification, public routes) and the
+  secret-key client; `createWithToken(url, key, token)` builds the user-scoped
+  `supabaseClient` of authenticated handlers and the client passed to
+  `userLoader`. Give the fake the query methods your handlers call (`from`,
+  `select`, `eq`, ...).
+- **Secret-key routes** (`requireServiceRole` / `bypassWithServiceRole`): add
+  `SUPABASE_SECRET_KEY` to the fake env and send it in the `apikey` header.
+- **Database routes** (`useDatabase: true`): pass
+  `getOrCreateDbClient: () => fakeDb` (it may also return a promise) to
+  `createContainer`; the pooler is then never contacted.
+- **Request IDs.** The router draws one ID per request from `idGenerator`
+  (`ctx.requestId`) before your handler runs; take that into account when a
+  handler also generates IDs.
+
+A longer example with custom services is in
+[`examples/testing-example.ts`](./examples/testing-example.ts).
+
+## The Library's Own Tests
+
+### Layout
+
+```
+tests/
+├── helpers.ts                 # createTestContainer, request, env fixtures
+├── auth_test.ts               # roles from app_metadata, userLoader, fail-closed
+│                              # auth/RBAC, anon & service-role bypass
+├── supabase_keys_test.ts      # key resolution, getClaims/JWKS, auth-server mode,
+│                              # secret key on apikey, legacy keys, getUser fallback
+├── router_test.ts             # matching, 404/405/HEAD, parsed params/query,
+│                              # middleware order, errors, body validation, database
+├── cors_openapi_test.ts       # CORS allowlists and preflight, OpenAPI output
+├── errors_test.ts             # errorHandlerMiddleware, createErrorResponseByEnv
+├── doc_comments_test.ts       # no relative imports inside comments (Supabase
+│                              # CLI bundling)
+└── integration/               # real Supabase stack, see below
+```
+
+`examples/testing-example.ts` also runs as part of `deno task test`.
+
+`tests/helpers.ts` provides:
+
+- `createTestContainer(users?, overrides?, env?)` - container whose Supabase
+  clients are fakes. `users` maps a bearer token to a Supabase user
+  (`{ id, email, app_metadata, user_metadata }`) returned by both `getClaims`
+  and `getUser`. The returned container also records `logs` and auth `calls`.
+- `request(path, { token, ...init })` - builds a `Request` for
+  `http://localhost<path>` with an optional bearer token.
+- `LEGACY_ENV` / `NEW_KEYS_ENV` - env with legacy keys or with the new
+  `SUPABASE_PUBLISHABLE_KEYS` / `SUPABASE_SECRET_KEYS` / `SUPABASE_JWKS` JSON.
+
+### Tasks
+
+| Task                         | What it does                                                               |
+| ---------------------------- | -------------------------------------------------------------------------- |
+| `deno task test`             | Unit tests (`tests/*_test.ts`) and `examples/testing-example.ts`           |
+| `deno task test:watch`       | Unit tests in watch mode                                                   |
+| `deno task test:coverage`    | Unit tests, collecting coverage into `coverage/`                           |
+| `deno task coverage`         | Writes an LCOV report to `coverage/lcov.info`                              |
+| `deno task coverage:html`    | Writes an HTML report to `coverage/html/` (does not open a browser)        |
+| `deno task check`            | Type-checks `mod.ts`, `examples/`, unit and integration tests              |
+| `deno task lint`             | `deno lint` plus `lint:complexity`                                         |
+| `deno task lint:complexity`  | ESLint complexity rules (below)                                            |
+| `deno task test:integration` | Integration tests against a local Supabase stack (Docker)                  |
+| `deno task ci`               | `deno fmt --check`, `deno lint`, ESLint complexity, type check, unit tests |
+
+Run a single file or test:
+
+```bash
+deno test -A tests/router_test.ts
+deno test -A tests/*_test.ts --filter "HEAD"
+```
+
+### Complexity Rules
+
+`deno task lint:complexity` runs ESLint (configured in `eslint.config.js`) only
+for rules that `deno lint` lacks:
+
+- cyclomatic `complexity` ≤ 10
+- `max-depth` 3
+- `max-params` 4
+- `max-nested-callbacks` 3
+- `max-lines-per-function` 60 (blank lines and comments not counted)
+
+Files in `tests/` and `examples/` are exempt from the last two.
+
+## Integration Tests (Real Supabase)
+
+The unit tests use fakes. `tests/integration/` checks the same behaviour against
+a real local Supabase stack: GoTrue (Auth), PostgREST with RLS, Postgres,
+Supavisor and the edge runtime.
+
+```bash
+deno task test:integration              # active signing key ES256 (default)
+deno task test:integration --alg RS256  # active signing key RS256
+deno task test:integration --keep       # leave the stack running afterwards
+```
+
+Requirements: Docker and the Supabase CLI. To use another CLI build, set
+`SUPABASE_CLI`, e.g. `SUPABASE_CLI="npx -y supabase@beta"`.
+
+`tests/integration/run.ts`:
+
+1. Generates the JWT signing keys: an active key with `--alg`, plus a "previous"
+   key of the other algorithm that is published for verification only, as after
+   a key rotation. GoTrue accepts only one private signing key, so the previous
+   key is written without its private part; its private JWK is kept in
+   `.generated/` so the tests can sign tokens with it.
+2. Vendors the library into `supabase/functions/_shared/router` and writes the
+   function's `deno.json` (the edge runtime only mounts `supabase/`).
+3. Starts a stack as project `supabase-router-it` on ports 553xx (API `55321`,
+   database `55322`, pooler `55329`), without Studio, Storage, Realtime and
+   other unused services, so it does not clash with a stack on the default
+   ports.
+4. Serves the `router-it` fixture function (`verify_jwt = false`) and waits for
+   it.
+5. Runs `tests/integration/*_test.ts`, passing the stack's URLs and keys via
+   env.
+6. Stops the stack (unless `--keep`; then stop it later with
+   `supabase stop --no-backup` from `tests/integration/`).
+
+What the suites cover (most run the router in-process against the stack;
+`edge_function_test.ts` goes through the API gateway to the deployed function):
+
+- `auth_test.ts` - tokens signed with the active algorithm carry `app_metadata`;
+  local verification with `SUPABASE_JWKS` and via the JWKS endpoint; role
+  escalation via `user_metadata` is rejected; the user-scoped client enforces
+  RLS; forged, garbage and API-key Bearer tokens are rejected; the secret key on
+  `apikey` reaches the admin API; headers as sent by supabase-js; legacy
+  anon/service_role keys; after sign-out, `claims` mode accepts the token until
+  it expires while `auth-server` mode rejects it.
+- `signing_keys_test.ts` - tokens signed by the previous (verify-only) key are
+  accepted, tokens signed by a key missing from the JWKS are rejected, legacy
+  HS256 tokens are verified by the Auth server.
+- `database_test.ts` - the transaction pooler client works through Supavisor,
+  where the dropped `statement_timeout` is reported as a warning, and over a
+  direct connection, where it applies.
+- `edge_function_test.ts` - the edge runtime provisions the new-style env
+  (`SUPABASE_PUBLISHABLE_KEYS`, `SUPABASE_SECRET_KEYS`, `SUPABASE_JWKS`);
+  `supabase.functions.invoke` with a signed-in user (200, RBAC 403) and signed
+  out (401); server-to-server calls with the secret key; `OPTIONS` responses
+  include the headers supabase-js sends.
+
+The local API gateway answers real CORS preflights itself, so they never reach
+the function. Preflight allowlists are therefore only covered by the unit tests
+(`cors_openapi_test.ts`).
+
+Generated artifacts (`.generated/`, `supabase/signing_keys.json`,
+`supabase/functions/_shared/`, `supabase/functions/router-it/deno.json`,
+`supabase/.temp/`, `supabase/.branches/`) are gitignored.
+
+The integration suite is not part of `deno task ci`.
 
 ## Continuous Integration
 
-### GitHub Actions Example
-
 ```yaml
-name: Tests
-on: [push, pull_request]
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
 jobs:
-  test:
+  ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: denoland/setup-deno@v1
-      - name: Run tests
-        run: deno task test:coverage
-      - name: Generate coverage
-        run: deno task coverage
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno task ci
 ```
 
-## Debugging Tests
+## Resources
 
-### Run Single Test
-
-```bash
-deno test __tests__/unit/security/sanitizer.test.ts
-```
-
-### Run with Verbose Output
-
-```bash
-deno test --allow-all --trace-ops __tests__/
-```
-
-### Use Debugger
-
-```typescript
-Deno.test("debug example", () => {
-  debugger; // Set breakpoint here
-  const result = functionUnderTest();
-  assertEquals(result, expected);
-});
-```
-
-Then run with:
-
-```bash
-deno test --inspect-brk __tests__/your-test.ts
-```
-
-## Additional Resources
-
-- [Deno Testing Documentation](https://deno.land/manual/testing)
-- [std/testing Assertions](https://deno.land/std/testing/asserts.ts)
-- [Test Helpers README](./__tests__/README.md)
-- [Example Tests](./examples/testing-example.ts)
-
-## Contributing Tests
-
-When contributing to the router:
-
-1. Write tests for all new features
-2. Update tests when changing behavior
-3. Ensure coverage targets are met
-4. Follow the existing test patterns
-5. Add test helpers for common patterns
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+- [Deno testing](https://docs.deno.com/runtime/fundamentals/testing/)
+- [`@std/assert`](https://jsr.io/@std/assert)
+- [DEPENDENCY_INJECTION.md](./DEPENDENCY_INJECTION.md) - the service container
+- [`examples/testing-example.ts`](./examples/testing-example.ts)

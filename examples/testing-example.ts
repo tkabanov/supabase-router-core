@@ -5,10 +5,10 @@
  * from the dependency injection container.
  */
 
-import { assertEquals, assertExists } from "jsr:@std/testing@0.224.0/asserts";
+import { assertEquals, assertExists } from "@std/assert";
 import { createContainer, defineRoute, defineRouter } from "../mod.ts";
 import type { ServiceContainer, SupabaseClient } from "../mod.ts";
-import { z } from "npm:zod";
+import { z } from "zod";
 
 const noopAsync = () => Promise.resolve();
 
@@ -66,22 +66,22 @@ class MockNotificationService implements NotificationService {
   }
 }
 
-// Mock Supabase client
+// Mock Supabase client. The default auth handler verifies tokens with
+// auth.getClaims() (JWKS-based for asymmetric signing keys).
 const createMockSupabaseClient = (): SupabaseClient =>
   ({
     auth: {
-      getUser: async (token: string) => {
+      getClaims: async (token: string) => {
         await noopAsync();
         if (token === "valid-token") {
           return {
             data: {
-              user: {
-                id: "test-user-123",
+              claims: {
+                sub: "test-user-123",
                 email: "test@example.com",
-                user_metadata: {
-                  role: "user",
-                  name: "Test User",
-                },
+                role: "authenticated",
+                app_metadata: { role: "user" },
+                user_metadata: { name: "Test User" },
               },
             },
             error: null,
@@ -89,7 +89,7 @@ const createMockSupabaseClient = (): SupabaseClient =>
         }
         return {
           data: null,
-          error: { message: "Invalid token" },
+          error: { message: "Invalid JWT" },
         };
       },
     },
@@ -232,7 +232,8 @@ Deno.test("Router DI - Create user sends email", async () => {
     env: {
       get: (key: string) => {
         if (key === "SUPABASE_URL") return "http://localhost:54321";
-        if (key === "SUPABASE_SERVICE_ROLE_KEY") return "test-key";
+        if (key === "SUPABASE_SECRET_KEY") return "sb_secret_test";
+        if (key === "SUPABASE_PUBLISHABLE_KEY") return "sb_publishable_test";
         return undefined;
       },
       require: (_key: string) => "test-value",
@@ -302,7 +303,8 @@ Deno.test("Router DI - Authenticated route with mocked auth", async () => {
     env: {
       get: (key: string) => {
         if (key === "SUPABASE_URL") return "http://localhost:54321";
-        if (key === "SUPABASE_SERVICE_ROLE_KEY") return "test-key";
+        if (key === "SUPABASE_SECRET_KEY") return "sb_secret_test";
+        if (key === "SUPABASE_PUBLISHABLE_KEY") return "sb_publishable_test";
         return undefined;
       },
       require: (_key: string) => "test-value",
@@ -434,9 +436,10 @@ Deno.test("Router DI - Custom ID generator", async () => {
   const response2 = await router.handler(request2);
   const data2 = await response2.json();
 
-  // Assert - Custom IDs are used
-  assertEquals(data1.id, "custom-id-1");
-  assertEquals(data2.id, "custom-id-2");
+  // Assert - Custom IDs are used. The router also draws one ID per request
+  // (ctx.requestId) before the handler runs, hence the even numbers.
+  assertEquals(data1.id, "custom-id-2");
+  assertEquals(data2.id, "custom-id-4");
 });
 
 // ============================================================================

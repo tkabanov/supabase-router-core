@@ -1,0 +1,72 @@
+{
+  "name": "@supabase-router/core",
+  "version": "2.0.0",
+  "exports": "./mod.ts",
+  "nodeModulesDir": "auto",
+  "imports": {
+    "@supabase/supabase-js": "jsr:@supabase/supabase-js@^2.117.2",
+    "zod": "npm:zod@^4.6.5",
+    "drizzle-orm": "npm:drizzle-orm@^0.45.3",
+    "drizzle-orm/postgres-js": "npm:drizzle-orm@^0.45.3/postgres-js",
+    "postgres": "npm:postgres@^3.4.9",
+    "@supabase/functions-js": "jsr:@supabase/functions-js@^2.117.2",
+    "@std/assert": "jsr:@std/assert@^1.0.19",
+    "@std/fs": "jsr:@std/fs@^1.0.24",
+    "eslint": "npm:eslint@^10.11.0",
+    "typescript-eslint": "npm:typescript-eslint@^8.70.1",
+    "@std/cli": "jsr:@std/cli@^1.0.28",
+    "@upstash/ratelimit": "npm:@upstash/ratelimit@^2.2.0",
+    "@upstash/redis": "npm:@upstash/redis@^1.39.0"
+  },
+  "tasks": {
+    "check": "deno check mod.ts examples/ tests/*.ts tests/integration/*.ts",
+    "lint": "deno lint && deno task lint:complexity",
+    "lint:complexity": "deno run -A npm:eslint@^10.11.0 .",
+    "test": "deno test -A tests/*_test.ts examples/testing-example.ts",
+    "test:watch": "deno test -A --watch tests/*_test.ts",
+    "test:coverage": "deno test -A --coverage=coverage tests/*_test.ts",
+    "test:integration": "deno run -A tests/integration/run.ts",
+    "coverage": "deno coverage coverage --lcov --output=coverage/lcov.info",
+    "coverage:html": "deno coverage coverage --html",
+    "ci": "deno fmt --check && deno task lint && deno task check && deno task test"
+  },
+  "lint": {
+    "exclude": [
+      "coverage/",
+      "node_modules/",
+      "tests/integration/.generated/",
+      "tests/integration/supabase/functions/_shared/"
+    ]
+  },
+  "fmt": {
+    "exclude": [
+      "*.md",
+      "coverage/",
+      "node_modules/",
+      "tests/integration/.generated/",
+      "tests/integration/supabase/functions/_shared/"
+    ]
+  },
+  "publish": {
+    "include": [
+      "mod.ts",
+      "router.ts",
+      "core/*.ts",
+      "database/*.ts",
+      "routing/*.ts",
+      "security/*.ts",
+      "validation/*.ts",
+      "authentication/*.ts",
+      "middleware/*.ts",
+      "errors/*.ts",
+      "examples/*.ts",
+      "docs/*.ts",
+      "README.md",
+      "LICENSE",
+      "CHANGELOG.md",
+      "TESTING.md",
+      "DEPENDENCY_INJECTION.md",
+      "GETTING_STARTED.md"
+    ]
+  }
+}

@@ -3,23 +3,25 @@
 [![JSR](https://jsr.io/badges/@supabase-router/core)](https://jsr.io/@supabase-router/core)
 [![JSR Score](https://jsr.io/badges/@supabase-router/core/score)](https://jsr.io/@supabase-router/core)
 
-Type-safe routing framework for Edge Functions (Supabase, Deno Deploy,
-Cloudflare Workers) with automatic authentication, DTO validation, and OpenAPI
+Type-safe routing framework for Supabase Edge Functions (and other Deno-based
+runtimes) with built-in Supabase authentication, DTO validation, and OpenAPI
 documentation generation.
 
 ## Features
 
-- **Security hardening** - Built-in protection against OWASP Top 10
-  vulnerabilities
+- **Security hardening** - Fail-closed auth and RBAC, path traversal and
+  prototype pollution protection, strict CORS allowlists, constant-time key
+  comparison, generic error responses
 - **Generic types** - Bring your own role system and user type
-- **Automatic validation** - Zod-based DTO validation with beautiful error
-  messages
-- **Built-in authentication** - Automatic auth with flexible RBAC
-- **OpenAPI generation** - Auto-generated API documentation
+- **Automatic validation** - Zod-based DTO validation with readable error
+  details
+- **Built-in authentication** - Supabase Auth by default, with flexible RBAC
+- **OpenAPI generation** - `router.openapi()` builds the spec from your routes
 - **Middleware support** - Composable request/response middleware
 - **Type-safe handlers** - Full type inference from schemas to handlers
 - **Dependency injection** - Easy testing and service injection
-- **Lightweight core** - Minimal runtime deps with optional Drizzle-based DB access
+- **Lightweight core** - Minimal runtime deps with optional Drizzle-based DB
+  access
 
 ## Installation
 
@@ -27,18 +29,16 @@ documentation generation.
 
 ```typescript
 // Direct import
-import {
-  defineRoute,
-  defineRouter,
-} from "jsr:@supabase-router/core@1.0.0";
+import { defineRoute, defineRouter } from "jsr:@supabase-router/core@2.0.0";
 ```
 
-Or add to `deno.json`:
+Or add to `deno.json` (the library requires Zod 4):
 
 ```json
 {
   "imports": {
-    "@router": "jsr:@supabase-router/core@^1.0.0"
+    "@supabase-router/core": "jsr:@supabase-router/core@^2.0.0",
+    "zod": "npm:zod@^4.6.5"
   }
 }
 ```
@@ -46,7 +46,7 @@ Or add to `deno.json`:
 Then import:
 
 ```typescript
-import { defineRoute, defineRouter } from "@router";
+import { defineRoute, defineRouter } from "@supabase-router/core";
 ```
 
 ### Local Development
@@ -61,70 +61,79 @@ import { defineRoute, defineRouter } from "../_shared/router/mod.ts";
 ### 1. Define your types
 
 ```typescript
-// roles.ts
+// types.ts
 export enum ProjectRoles {
   ADMIN = "admin",
   USER = "user",
   GUEST = "guest",
 }
 
-// types.ts
+// Shape of the user built by the default auth handler: the token's
+// `app_metadata` (e.g. `role`) plus `id` and `email`
 export interface MyUser {
   id: string;
-  email: string;
-  role: ProjectRoles;
-  companyId: number;
+  email?: string;
+  role?: ProjectRoles;
 }
 ```
 
 ### 2. Create a router
 
 ```typescript
-import { defineRoute, defineRouter } from "@supabase-router/core";
+import { created, defineRoute, defineRouter } from "@supabase-router/core";
 import { z } from "zod";
-import { MyUser, ProjectRoles } from "./types.ts";
+import { type MyUser, ProjectRoles } from "./types.ts";
 
-const createUserSchema = z.object({
+const createProjectSchema = z.object({
   name: z.string().min(1),
-  email: z.email(),
-  role: z.nativeEnum(ProjectRoles),
+  ownerEmail: z.email(),
+  visibility: z.enum(["private", "public"]),
 });
 
 const router = defineRouter<ProjectRoles, MyUser>({
   basePath: "/api/v1",
-  defaultTags: ["API"],
+  defaultTags: ["API"], // optional
 
-  // Custom authentication handler
-  authHandler: async (req: Request, options: AuthOptions<MyRoles>) => {
-    const token = req.headers.get("Authorization")?.replace("Bearer ", "");
-    // Your auth logic here
-    return { user, supabaseClient };
-  },
+  // No authHandler: the built-in Supabase auth is used. Optionally load the
+  // user (and its role) from your own table instead of `app_metadata`:
+  // userLoader: async (userId, supabase) => { ... },
 
   routes: [
     defineRoute({
-      method: "POST",
-      path: "/users",
-      summary: "Create user (admin only)",
-      description: "Creates a new user in the system",
+      method: "GET",
+      path: "/health",
+      summary: "Health check",
+      authRequired: false, // routes are authenticated unless set to false
+      handler: async () => ({ status: "ok" }),
+    }),
 
-      // Automatic authentication + RBAC
-      authRequired: true,
+    defineRoute({
+      method: "POST",
+      path: "/projects",
+      summary: "Create project (admin only)",
+      description: "Creates a new project",
+
+      // Authentication is on by default; allowedRoles adds RBAC
       allowedRoles: [ProjectRoles.ADMIN],
 
       // Automatic validation
       requestSchema: {
-        body: createUserSchema,
+        body: createProjectSchema,
       },
 
       // Fully typed handler
       handler: async ({ body, user, supabaseClient }) => {
-        // body is typed as z.infer<typeof createUserSchema>
-        // user is typed as MyUser
-        // user.role is guaranteed to be ProjectRoles.ADMIN
+        // body is typed as z.infer<typeof createProjectSchema>
+        // user is typed as MyUser, with role ADMIN
+        // supabaseClient is scoped to the user, so RLS applies
+        const { data, error } = await supabaseClient
+          .from("projects")
+          .insert({ ...body, created_by: user.id })
+          .select()
+          .single();
 
-        const newUser = await createUser(supabaseClient, body);
-        return { success: true, user: newUser };
+        if (error) throw error; // logged, client gets a generic 500
+        return created(data);
       },
     }),
   ],
@@ -138,9 +147,12 @@ if (import.meta.main) {
 
 ### 3. Generate OpenAPI docs
 
-```bash
-efr doc-gen
+```typescript
+const spec = router.openapi(); // OpenAPI document built from your routes
+console.log(JSON.stringify(spec, null, 2));
 ```
+
+See [OpenAPI Documentation](#openapi-documentation) for serving it.
 
 ## Core Concepts
 
@@ -150,33 +162,41 @@ Routes are defined with `defineRoute()` and provide full type safety:
 
 ```typescript
 defineRoute({
-  method: 'GET',              // HTTP method
-  path: '/users/:id',         // Path with parameters
-  summary: 'Get user',        // OpenAPI summary
-  description: '...',         // OpenAPI description
-  authRequired: true,         // Enable authentication
-  allowedRoles: [Roles.ADMIN], // RBAC
-  
+  method: "GET", // HTTP method
+  path: "/users/:id", // Path with parameters
+  summary: "Get user", // OpenAPI summary
+  description: "...", // OpenAPI description
+  allowedRoles: [ProjectRoles.ADMIN], // RBAC (auth is on by default)
+
   requestSchema: {
-    params: z.object({ id: z.string() }),
+    params: z.object({ id: z.uuid() }),
     query: z.object({ include: z.string().optional() }),
-    body: z.object({ ... })
   },
-  
-  responseSchema: z.object({ ... }),
-  
-  handler: async (ctx) => {
-    // ctx.params.id is typed as string
-    // ctx.query.include is typed as string | undefined
-    // ctx.body is typed according to schema
-    return { ... };
-  }
-})
+
+  responseSchema: z.object({ id: z.string(), include: z.string().optional() }),
+
+  handler: async ({ params, query }) => {
+    // params.id is typed as string
+    // query.include is typed as string | undefined
+    return { id: params.id, include: query.include };
+  },
+});
 ```
 
 The router infers full types for `params`, `query`, `body`, and `user`
-automatically from your Zod schemas and authentication settings, so handler
-destructuring works without manual annotations.
+automatically from your Zod schemas and the router's generics
+(`defineRouter<Role, User>`), so handler destructuring works without manual
+annotations. Without the generics, `user` is typed as `unknown`.
+
+- Routes require authentication by default (`authRequired` defaults to
+  `true`). Public routes must set `authRequired: false`; there `user` is not
+  available and `supabaseClient` is an optional anonymous client
+  (`SupabaseClient | undefined`).
+- Handlers return plain data (sent as JSON with `successResponseCode`, default
+  `200`) or a `Response`.
+- Static segments take precedence over parameters (`/users/me` before
+  `/users/:id`), `HEAD` is served by the matching `GET` route, and an unknown
+  method on a known path returns `405` with an `Allow` header.
 
 ### Authentication
 
@@ -189,22 +209,29 @@ If you don't provide an `authHandler`, the router automatically uses Supabase
 Auth:
 
 ```typescript
-const router = defineRouter({
+const router = defineRouter<ProjectRoles, MyUser>({
   basePath: "/api",
   // No authHandler needed!
+
+  // Optional: load the user and role from your own table
+  userLoader: async (userId, supabase) => {
+    const { data } = await supabase
+      .from("profiles")
+      .select("id, email, role")
+      .eq("id", userId)
+      .single();
+    return data as MyUser | null;
+  },
+
   routes: [
     defineRoute({
       method: "GET",
       path: "/profile",
-      authRequired: true, // Automatically validates Bearer token
-      handler: async ({ user, supabaseClient, services }) => {
+      // Authenticated by default: validates the Bearer token
+      handler: async ({ user, supabaseClient }) => {
         // supabaseClient is user-scoped and respects RLS
-        // Access service-role capabilities explicitly when needed
-        const serviceClient = services.getOrCreateServiceClient();
-        return {
-          userId: user.id,
-          serviceClientAvailable: Boolean(serviceClient),
-        };
+        const { data } = await supabaseClient.from("settings").select();
+        return { userId: user.id, settings: data };
       },
     }),
   ],
@@ -213,83 +240,145 @@ const router = defineRouter({
 
 **Requirements:**
 
-- Environment variables: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and
-  `SUPABASE_ANON_KEY`
-- Users must have `role` field in `user_metadata` for RBAC
+- Environment variables: `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEYS`
+  (plus `SUPABASE_SECRET_KEYS` for secret-key routes). Hosted Edge Functions
+  provision them automatically; locally the CLI provides
+  `SUPABASE_PUBLISHABLE_KEY` / `SUPABASE_SECRET_KEY`. The legacy
+  `SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_ROLE_KEY` are still accepted, but
+  Supabase deprecates them by the end of 2026.
+- Set `verify_jwt = false` for the function in `supabase/config.toml`: the
+  router does its own verification, and secret-key callers send no user JWT.
+- For RBAC, users need a `role` in **`app_metadata`** (set server-side, e.g.
+  `supabase.auth.admin.updateUserById(id, { app_metadata: { role: "admin" } })`),
+  or provide a `userLoader` that loads the user and role from your own table.
+  `user_metadata` is never used for `id`, `email` or `role`: every user can
+  edit it via `auth.updateUser`, so trusting it would allow privilege
+  escalation. It is still available as `user.user_metadata`.
 - Send requests with: `Authorization: Bearer <user_access_token>`
 
 **What it does:**
 
-1. Validates Bearer token using Supabase Auth API (service-role client is used
-   internally only for verification)
-2. Extracts user data from JWT
+1. Verifies the Bearer token with `auth.getClaims()`. With asymmetric JWT
+   signing keys (ES256/RS256, the Supabase default) the signature is checked
+   locally against `SUPABASE_JWKS` / the project's JWKS endpoint, without a
+   request to the Auth server. Legacy HS256 projects fall back to the Auth
+   server. Trade-off: a signed-out session stays valid until its access token
+   expires; set `tokenVerification: "auth-server"` on the router to check every
+   token with `auth.getUser()` instead.
+2. Builds the user from `app_metadata` plus `id`, `email`, `user_metadata` and
+   `is_anonymous` (or calls `userLoader(userId, client)`)
 3. Checks RBAC if `allowedRoles` specified
 4. Provides `user` and a user-scoped `supabaseClient` to handlers (RLS active)
 
 #### Custom Authentication
 
-For custom logic, provide an `authHandler`:
+For custom logic, provide an `authHandler` (`userLoader` and
+`tokenVerification` are then ignored):
 
 ```typescript
-const router = defineRouter<MyRoles, MyUser>({
-  basePath: '/api',
-  
+import { createClient } from "@supabase/supabase-js";
+import {
+  type AuthOptions,
+  defineRouter,
+  parseBearerToken,
+  unauthorized,
+} from "@supabase-router/core";
+
+const router = defineRouter<ProjectRoles, MyUser>({
+  basePath: "/api",
+
   // Custom auth handler
-  authHandler: async (req: Request, options: AuthOptions<MyRoles>) => {
-    // Implement your auth logic
-    const token = req.headers.get('Authorization');
-    
+  authHandler: async (req: Request, options: AuthOptions<ProjectRoles>) => {
+    const token = parseBearerToken(req.headers.get("Authorization"));
+
     if (options.requireServiceRole) {
-      // Check for service role
+      // Check your service credentials here
     }
-    
-    if (options.requireUserAuth) {
-      const user = await validateUser(token);
-      const client = createClient(...);
-      return { user, supabaseClient: client };
+
+    // requireUserAuth defaults to true: a result without `user` is rejected
+    // with 401 unless the route sets `requireUserAuth: false`.
+    // RBAC (`allowedRoles`) is checked by the router afterwards and always
+    // requires a user.
+    const user = token ? await validateUser(token) : null; // your logic
+    if (!user) {
+      return { response: unauthorized("Invalid token") };
     }
-    
-    return {}; // No auth
+    const supabaseClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_PUBLISHABLE_KEY")!,
+      { global: { headers: { Authorization: `Bearer ${token}` } } },
+    );
+    return { user, supabaseClient };
   },
-  
-  routes: [...]
+
+  routes: [],
 });
 ```
 
-#### Service Role and Anon Key
+#### Secret Key (Service Role) and Publishable Key (Anon)
 
-⚠️ **SECURITY WARNING**: `requireServiceRole` should **NEVER** be used for frontend-accessible endpoints.
-Service role key bypasses Row Level Security (RLS) and has full database access.
-Only use this for internal/admin operations or server-to-server communication.
+⚠️ **SECURITY WARNING**: `requireServiceRole` should **NEVER** be used for
+frontend-accessible endpoints. Secret (service role) keys bypass Row Level
+Security (RLS) and have full database access. Only use this for
+internal/admin operations or server-to-server communication. The router logs
+a warning once via `services.logger` when it is created with such a route.
 
-The default auth handler supports service role and anon key bypass while keeping
-request handlers RLS-first:
+Send secret keys on the `apikey` header (recommended by Supabase); the router
+also accepts them, and legacy `service_role` JWTs, on
+`Authorization: Bearer`. The secret key skips the user and RBAC checks.
 
 ```typescript
-// Service role endpoint (internal use ONLY - never expose to frontend!)
+// Secret key endpoint (internal use ONLY - never expose to frontend!)
 defineRoute({
+  method: "POST",
+  path: "/internal/cleanup",
   authentication: {
     requireServiceRole: true,
-    requireUserAuth: false,
   },
   handler: async ({ serviceRoleClient }) => {
-    // Only accessible with service role key
-    // Authorization: Bearer <SUPABASE_SERVICE_ROLE_KEY>
+    // Only accessible with a secret key:
+    //   apikey: sb_secret_...
     // serviceRoleClient is already elevated
-    // ⚠️ WARNING: This endpoint will log a security warning when defined
+    await serviceRoleClient!
+      .from("sessions")
+      .delete()
+      .lt("expires_at", new Date().toISOString());
+    return { ok: true };
   },
 });
 
-// Bypass with service role OR user token
+// Secret key OR user token
 defineRoute({
+  method: "GET",
+  path: "/reports",
   authentication: {
     bypassWithServiceRole: true,
-    requireUserAuth: true,
   },
   handler: async ({ user, supabaseClient, serviceRoleClient }) => {
-    // Accessible with either service role OR user token
-    // user-scoped supabaseClient maintains RLS, serviceRoleClient is available
-    // only when a service token was provided.
+    // With the secret key, serviceRoleClient is set and `user` is undefined
+    // (despite its type), so check serviceRoleClient first
+    if (serviceRoleClient) {
+      return { caller: "service" };
+    }
+    // Otherwise a user token was sent: supabaseClient is user-scoped (RLS)
+    const { data } = await supabaseClient.from("reports").select();
+    return { caller: user.id, reports: data };
+  },
+});
+
+// Publishable (anon) key OR user token
+defineRoute({
+  method: "GET",
+  path: "/catalog",
+  authentication: {
+    bypassWithAnonRole: true,
+  },
+  handler: async ({ user }) => {
+    // Accepts a publishable/anon key on `apikey` or `Authorization`. These
+    // keys ship with every frontend, so the route is effectively public:
+    // `user` is undefined for key-only callers, and RBAC rejects them.
+    // A valid user token still takes precedence.
+    return { signedIn: Boolean(user) };
   },
 });
 ```
@@ -298,42 +387,56 @@ defineRoute({
 
 ```typescript
 defineRoute({
-  authRequired: true,
+  method: "PUT",
+  path: "/moderation/:id",
   authentication: {
-    allowedMethods: ["POST", "PUT"],
-    requireUserAuth: true,
+    requireUserAuth: true, // default
     requireRBAC: true,
-    allowedRoles: [Roles.ADMIN, Roles.MODERATOR],
+    allowedRoles: [ProjectRoles.ADMIN, ProjectRoles.USER],
   },
   handler: async ({ user }) => {
-    // user is guaranteed to exist and have required role
+    // user is guaranteed to exist and have a required role
+    return { moderator: user.id };
   },
 });
 ```
 
+`allowedRoles` on the route is a shorthand for `requireRBAC` +
+`authentication.allowedRoles`. RBAC always needs a user and fails closed.
+
 ### Validation
 
-Automatic DTO validation with Zod:
+Automatic DTO validation with Zod 4:
 
 ```typescript
 defineRoute({
+  method: "POST",
+  path: "/signup",
+  authRequired: false,
   requestSchema: {
     body: z.object({
-      email: z.string().email(),
+      email: z.email(),
       age: z.number().min(18),
     }),
   },
   handler: async ({ body }) => {
     // body is typed and validated
     // If validation fails, returns 400 with details
+    return { email: body.email };
   },
 });
 ```
+
+Malformed JSON returns `400 Malformed request body`; an unsupported
+`Content-Type` returns `415`. Handlers receive the parsed schema output (e.g.
+`z.coerce.number()` yields a number).
 
 #### Multi-content-type support
 
 ```typescript
 defineRoute({
+  method: "POST",
+  path: "/uploads",
   requestSchema: {
     body: {
       "application/json": jsonSchema,
@@ -342,6 +445,7 @@ defineRoute({
   },
   handler: async ({ body }) => {
     // body is parsed based on Content-Type
+    return { received: body };
   },
 });
 ```
@@ -350,11 +454,13 @@ defineRoute({
 
 ```typescript
 defineRoute({
+  method: "POST",
+  path: "/webhook",
   disableDTOValidation: true,
   handler: async ({ req }) => {
     // Parse and validate manually
     const body = await req.json();
-    // ...
+    return { received: body };
   },
 });
 ```
@@ -364,100 +470,130 @@ defineRoute({
 Middleware can be applied globally or per-route:
 
 ```typescript
-import { loggingMiddleware, timingMiddleware } from '@supabase-router/core';
+import {
+  defineRouter,
+  loggingMiddleware,
+  timingMiddleware,
+} from "@supabase-router/core";
 
 const router = defineRouter({
-  basePath: '/api',
-  
+  basePath: "/api",
+
   // Global middlewares
   middlewares: [
     loggingMiddleware({ logBody: false }),
-    timingMiddleware()
+    timingMiddleware(),
   ],
-  
-  routes: [...]
+
+  routes: [],
 });
 ```
 
-Middleware contexts now expose `user`, `supabaseClient`, and
-`serviceRoleClient` (when available), so permission-aware logic can run without
-manual casts.
+**Execution order:**
+
+```
+route match → global middlewares → auth → params → query → body → db
+            → route middlewares → handler
+```
+
+- CORS preflights (`OPTIONS`), unmatched paths (`404`) and unknown methods
+  (`405`) are answered **before** global middlewares run.
+- **Global** middlewares wrap the rest of the pipeline, so rate limiting, body
+  size limits, timeouts and error handling also cover unauthenticated and
+  invalid requests. `ctx.user`, `ctx.body` and `ctx.db` are populated only
+  after `await next()`.
+- **Route** middlewares run right before the handler; `ctx.user`,
+  `ctx.supabaseClient`, `ctx.serviceRoleClient`, `ctx.body` and `ctx.db` are
+  available.
+- Unhandled errors are logged via `services.logger` and returned as a generic
+  `500 { error: "Internal server error", requestId }`.
 
 #### Rate Limiting
 
-**WARNING: Production Rate Limiting**
-
-The built-in `rateLimitMiddleware()` uses in-memory storage and **DOES NOT
-WORK** in serverless environments with auto-scaling. It's only suitable for
-local development.
-
-For production, use one of these solutions:
-
-1. **Cloudflare Rate Limiting** (Recommended if available)
-   - Automatic, no code needed
-   - Configure in Cloudflare dashboard
-
-2. **Redis-based Rate Limiting** (For Supabase Edge Functions)
+Edge Functions run many short-lived instances, so rate limits must live in a
+shared store; the package has no in-memory limiter. Copy
+`examples/redis-rate-limit.ts` into your project (replace its `../mod.ts`
+import with `@supabase-router/core`). It wraps
+[`@upstash/ratelimit`](https://github.com/upstash/ratelimit-js) (atomic sliding
+window over HTTP Redis, as recommended by Supabase):
 
 ```typescript
-import { Redis } from '@upstash/redis';
-import { redisRateLimitMiddleware } from '../_shared/router/examples/redis-rate-limit.ts';
+import { defineRoute } from "@supabase-router/core";
+import { createUpstashLimiter, rateLimit } from "./redis-rate-limit.ts";
 
-const redis = new Redis({
-  url: Deno.env.get('UPSTASH_REDIS_URL')!,
-  token: Deno.env.get('UPSTASH_REDIS_TOKEN')!,
-});
+// Reads UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN
+const limiter = createUpstashLimiter(10, "10 s");
 
-const router = defineRouter({
+defineRoute({
+  method: "POST",
+  path: "/messages",
+  // Route middleware: runs after auth, so it can limit per user
   middlewares: [
-    redisRateLimitMiddleware({
-      redis,
-      maxRequests: 100,
-      windowMs: 60000, // 1 minute
-    }),
+    rateLimit({ limiter, key: (ctx) => (ctx.user as { id: string }).id }),
   ],
-  routes: [...]
+  handler: () => Promise.resolve({ sent: true }),
 });
 ```
 
-See `examples/redis-rate-limit.ts` for complete implementation and setup
-instructions.
+- Limited requests get `429` with `Retry-After` and `X-RateLimit-*` headers.
+- If Redis is unavailable, requests pass (`failOpen: true`, logged); set
+  `failOpen: false` to answer `503`.
+- As a global middleware it also protects authentication, but `ctx.user` is not
+  set yet there. Only key by IP using the header entry your platform's proxy
+  guarantees: clients can add their own `x-forwarded-for` values.
 
 #### Custom middleware
 
 ```typescript
-const authMiddleware: Middleware = async (ctx, next) => {
-  console.log(`Request: ${ctx.req.method} ${ctx.req.url}`);
+import type { Middleware } from "@supabase-router/core";
+
+const requestLogger: Middleware = async (ctx, next) => {
+  ctx.services.logger.log(`Request: ${ctx.req.method} ${ctx.req.url}`);
 
   const response = await next();
 
-  console.log(`Response: ${response.status}`);
+  ctx.services.logger.log(`Response: ${response.status} (${ctx.requestId})`);
   return response;
 };
 ```
 
 ### Error Handling
 
-Built-in error responses with sanitization:
+Built-in error response helpers:
 
 ```typescript
-import { badRequest, notFound, unauthorized } from "@supabase-router/core";
+import { defineRoute, notFound } from "@supabase-router/core";
 
 defineRoute({
-  handler: async ({ body }) => {
-    if (!body.email) {
-      return badRequest("Email is required");
+  method: "GET",
+  path: "/projects/:id",
+  requestSchema: { params: z.object({ id: z.uuid() }) },
+  handler: async ({ params, supabaseClient }) => {
+    const { data } = await supabaseClient
+      .from("projects")
+      .select()
+      .eq("id", params.id)
+      .maybeSingle();
+
+    if (!data) {
+      return notFound("Project not found");
     }
 
-    const user = await findUser(body.email);
-    if (!user) {
-      return notFound("User not found");
-    }
-
-    return { user };
+    return data;
   },
 });
 ```
+
+Also available: `ok`, `created`, `noContent`, `badRequest`, `unauthorized`,
+`forbidden`, `methodNotAllowed`, `unprocessableEntity`, `internalServerError`.
+Error messages are sanitized (control characters removed, length limited) and
+returned as JSON with `X-Content-Type-Options: nosniff`; they are not
+HTML-escaped, so escape them if you render them as HTML.
+
+Unhandled errors return a generic `500` with a `requestId`; details only go to
+`services.logger`. `errorHandlerMiddleware(isDevelopment)` and
+`createErrorResponseByEnv(error, isDevelopment)` include the real message (and
+stack) only when `isDevelopment` is `true`, and a generic message otherwise.
 
 ### CORS
 
@@ -465,30 +601,45 @@ Configure CORS globally or per-route:
 
 ```typescript
 const router = defineRouter({
-  basePath: '/api',
-  
-  // Global CORS
+  basePath: "/api",
+
+  // Global CORS (applies to every route)
   corsHeaders: {
-    allowedOrigins: ['https://example.com', 'https://app.example.com'],
-    allowedMethods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true
+    allowedOrigins: ["https://example.com", "https://app.example.com"],
+    allowedMethods: ["GET", "POST", "PUT", "DELETE"],
+    // allowedHeaders omitted: defaults cover the supabase-js headers
+    credentials: true,
   },
-  
+
   routes: [
     defineRoute({
-      path: '/public',
-      
-      // Route-specific CORS
+      method: "GET",
+      path: "/public",
+      authRequired: false,
+
+      // Route-specific CORS: replaces the router config for this route
       corsHeaders: {
-        allowedOrigins: '*'
+        allowedOrigins: "*",
       },
-      
-      handler: async () => { ... }
-    })
-  ]
+
+      handler: async () => ({ ok: true }),
+    }),
+  ],
 });
 ```
+
+- Without any configuration, permissive defaults (`*`) are used.
+- A route-level `corsHeaders` **replaces** (does not merge with) the router
+  config.
+- If `allowedHeaders` is omitted, the default list is used: `authorization`,
+  `x-client-info`, `apikey`, `content-type`, `x-retry-count`, `traceparent`,
+  `tracestate`, `baggage` (what supabase-js sends). If you set it, include
+  those headers.
+- Allowlisted origins are echoed back with `Vary: Origin`; other origins get
+  no `Access-Control-Allow-Origin`. `allowedOrigins: "*"` with
+  `credentials: true` throws when the router is created.
+- Note: the **local** Supabase gateway answers CORS preflights itself, so
+  test preflight behaviour against a deployed function.
 
 ## Dependency Injection
 
@@ -501,6 +652,8 @@ Every handler has access to core services via the `services` property:
 
 ```typescript
 defineRoute({
+  method: "GET",
+  path: "/services",
   handler: async ({ services }) => {
     // Logger
     services.logger.log("Processing request");
@@ -511,10 +664,10 @@ defineRoute({
     // Environment Variables
     const apiKey = services.env.get("API_KEY");
 
-    // Supabase Client Factory (used internally)
-    const client = services.supabaseClientFactory.create(url, key);
+    // Cached Supabase clients (publishable key / secret key)
+    const anonClient = services.getOrCreateAnonClient();
 
-    return { id };
+    return { id, hasApiKey: Boolean(apiKey), anon: Boolean(anonClient) };
   },
 });
 ```
@@ -524,7 +677,12 @@ defineRoute({
 Inject your own services (email, payment, analytics, etc.):
 
 ```typescript
-import { createContainer } from '@supabase-router/core';
+import {
+  createContainer,
+  defineRoute,
+  defineRouter,
+  type ServiceContainer,
+} from "@supabase-router/core";
 
 // 1. Define service interface
 interface EmailService {
@@ -548,20 +706,22 @@ const container: AppServices = createContainer({
   emailService: new SendGridService(),
 });
 
-// 5. Pass to router
-const router = defineRouter({
-  basePath: '/api',
+// 5. Pass to router (third generic = container type)
+const router = defineRouter<ProjectRoles, MyUser, AppServices>({
+  basePath: "/api",
   container, // Inject custom services
-  routes: [...]
+  routes: [
+    // 6. Use in handlers
+    defineRoute({
+      method: "POST",
+      path: "/welcome",
+      handler: async ({ services, user }) => {
+        await services.emailService.sendEmail(user.email!, "Welcome!");
+        return { sent: true };
+      },
+    }),
+  ],
 });
-
-// 6. Use in handlers
-defineRoute({
-  handler: async ({ services }) => {
-    const appServices = services as AppServices;
-    await appServices.emailService.sendEmail('user@example.com', 'Welcome!');
-  }
-})
 ```
 
 ### Testing with Mocks
@@ -569,28 +729,28 @@ defineRoute({
 The main benefit is easy testing:
 
 ```typescript
-import { createContainer } from '@supabase-router/core';
+import { createContainer, defineRouter } from "@supabase-router/core";
 
 const testContainer = createContainer({
   // Mock email service
   emailService: {
-    sendEmail: async (to, subject) => {
-      console.log(`[TEST] Email to ${to}`);
-    }
+    sendEmail: async (to: string, subject: string) => {
+      console.log(`[TEST] Email to ${to}: ${subject}`);
+    },
   },
-  
+
   // Silent logger for tests
   logger: {
     log: () => {},
     error: () => {},
-    warn: () => {}
-  }
+    warn: () => {},
+  },
 });
 
 const router = defineRouter({
-  basePath: '/api',
+  basePath: "/api",
   container: testContainer,
-  routes: [...]
+  routes: [],
 });
 
 // Now you can test without sending real emails!
@@ -609,33 +769,43 @@ semantics while letting you issue SQL/ORM calls or wrap work in transactions.
 
 ```typescript
 const router = defineRouter({
-  basePath: '/api',
+  basePath: "/api",
   database: {
     enableTransactionPooler: true,
-    connectionStringEnv: 'SUPABASE_DB_POOLER_URL',
+    connectionStringEnv: "SUPABASE_DB_POOLER_URL", // default
     maxConnections: 4,
-    statementTimeoutMs: 10_000,
-    disablePreparedStatements: true, // Required for PgBouncer transaction mode
+    // disablePreparedStatements defaults to true (required by the pooler)
   },
-  routes: [...]
+  routes: [],
 });
 ```
 
 Supply a connection string for the transaction pooler (from the Supabase
-dashboard) via `SUPABASE_DB_POOLER_URL`. The router lazily initialises a shared
-`postgres` driver + Drizzle instance and reuses it across requests.
+dashboard) via `SUPABASE_DB_POOLER_URL`. The router lazily loads `postgres` +
+Drizzle on first use, creates a shared client and reuses it across requests.
+
+**Statement timeouts:** transaction poolers (Supavisor on port 6543, PgBouncer)
+drop connection parameters, so `statementTimeoutMs` has no effect through them
+(the router logs a warning when it is not applied). Set the timeout on the
+database role instead, which works through the pooler:
+
+```sql
+ALTER ROLE <role> SET statement_timeout = '10s';
+```
 
 ### Using the client in routes
 
 Routes opt in individually:
 
 ```typescript
+import { sql } from "drizzle-orm";
+
 defineRoute({
-  method: 'POST',
-  path: '/reports/weekly',
+  method: "POST",
+  path: "/reports/weekly",
   useDatabase: true,
   handler: async ({ db }) => {
-    if (!db) throw new Response('Database unavailable', { status: 503 });
+    if (!db) throw new Response("Database unavailable", { status: 503 });
 
     await db.transaction(async (tx) => {
       // Replace with your queries / ORM calls
@@ -647,18 +817,25 @@ defineRoute({
 });
 ```
 
-The `ctx.db` property is only populated when `useDatabase: true`. Middlewares
-receive the same `db` reference, enabling cross-cutting concerns such as
-auditing.
+The `ctx.db` property is only populated when `useDatabase: true`. Route
+middlewares receive the same `db` reference (enabling cross-cutting concerns
+such as auditing); global middlewares only after `await next()`. If you
+provide your own `getOrCreateDbClient` in the container, it may return the
+client or a promise of it.
+
+The pooler client connects as the role in your connection string and does
+not carry the caller's JWT, so RLS policies based on `auth.uid()` do not
+apply: authorize requests in your handler.
 
 ### Safety checklist
 
 - Prefer the transaction pooler for stateless workloads; avoid long-lived
   transactions.
-- Keep `disablePreparedStatements: true` unless you know the pooler supports
-  session-level prepared statements.
-- Choose conservative timeouts (`statementTimeoutMs`, `connectionTimeoutMs`) to
-  prevent runaway queries from occupying the pool.
+- Keep prepared statements disabled (the default) unless you connect in
+  session mode.
+- Set `statement_timeout` on the database role (see above) and keep
+  `connectionTimeoutMs` conservative to prevent runaway queries from occupying
+  the pool.
 - Scope the database credentials to the minimum privileges required by these
   handlers.
 - Log and monitor pool saturation (5xx responses with `"Database connection
@@ -668,121 +845,115 @@ auditing.
 
 ## Security Features
 
-- Path traversal protection
-- Prototype pollution protection
-- XSS protection in error messages
-- CORS security (no wildcard with credentials)
-- Header injection protection
-- Safe regex (no ReDoS)
-- Input sanitization
-- File upload size limits
-- Security headers (X-Content-Type-Options, X-Frame-Options, etc.)
+- Fail-closed authentication: routes are authenticated by default,
+  `requireUserAuth` defaults to `true`, RBAC always requires a user
+- Default auth takes roles only from `app_metadata` or your `userLoader`,
+  never `user_metadata`
+- Constant-time comparison of API keys, strict `Bearer` parsing
+- Path traversal, null byte and length checks on path parameters (before any
+  regex matching)
+- Prototype pollution protection for query parameters and form bodies
+- CORS allowlists with `Vary: Origin`; wildcard + credentials is rejected
+- Header name validation for configured CORS header lists
+- Error messages sanitized and returned as JSON with `nosniff`; unhandled
+  errors return a generic `500`
+- Multipart file size limit (`DEFAULT_MAX_FILE_SIZE`, 10 MB)
+
+Security headers are **not** added automatically. `DEFAULT_SECURITY_HEADERS`
+(X-Content-Type-Options, X-Frame-Options, HSTS, CSP, ...) is exported so you
+can apply it yourself, e.g. with a global middleware:
+
+```typescript
+import {
+  DEFAULT_SECURITY_HEADERS,
+  type Middleware,
+} from "@supabase-router/core";
+
+const securityHeaders: Middleware = async (_ctx, next) => {
+  const response = await next();
+  const headers = new Headers(response.headers);
+  for (const [name, value] of Object.entries(DEFAULT_SECURITY_HEADERS)) {
+    headers.set(name, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+};
+```
 
 ## OpenAPI Documentation
 
 ### Generate documentation
 
-```bash
-efr doc-gen
-```
-
-### Configuration
-
-Create `openapi.config.ts` in your project root:
+`router.openapi()` returns an OpenAPI document built from your routes:
 
 ```typescript
-export default {
-  input: {
-    include: ["supabase/functions/**/index.ts"],
-    exclude: ["**/doc/**", "**/_shared/**"],
-  },
-  output: {
-    path: "supabase/functions/openapi/schema.ts",
-    format: "typescript", // or 'json', 'yaml'
-  },
-  spec: {
-    openapi: "3.0.0",
-    info: {
-      title: "My API",
-      version: "1.0.0",
-      description: "API Documentation",
-      contact: {
-        name: "API Support",
-        email: "support@example.com",
-      },
-    },
+const router = defineRouter({
+  basePath: "/api",
+  openapi: {
+    title: "My API", // default: "API Documentation"
+    version: "1.0.0", // default: "1.0.0"
+    description: "API Documentation",
     servers: [
       { url: "http://localhost:54321/functions/v1", description: "Local" },
-      { url: "https://api.prod.com/functions/v1", description: "Production" },
     ],
   },
-};
+  routes: [],
+});
+
+const spec = router.openapi();
 ```
+
+- Request/response schemas are inlined per operation (generated with Zod's
+  `toJSONSchema`); every path parameter is declared.
+- Security schemes: `supabaseBearerAuth` (user token), `supabaseSecretKey` and
+  `supabasePublishableKey` (`apikey` header), plus deprecated legacy bearer
+  schemes. Routes are documented with the scheme(s) they accept; add your own
+  with the `securitySchemes` router option or per-route `security`.
 
 ### Access documentation
 
-The generated schema can be used with Swagger UI, Redoc, or other OpenAPI tools:
+The spec can be used with Swagger UI, Redoc, or other OpenAPI tools:
 
 ```typescript
-// doc/index.ts
-import { schema } from "../openapi/schema.ts";
-
 Deno.serve((req) => {
   const url = new URL(req.url);
 
-  if (url.searchParams.get("json")) {
-    return new Response(JSON.stringify(schema), {
-      headers: { "Content-Type": "application/json" },
-    });
+  if (url.pathname.endsWith("/openapi.json")) {
+    return Response.json(router.openapi());
   }
 
-  // Render with Redoc
-  return new Response(
-    `
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <title>API Docs</title>
-        <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
-      </head>
-      <body>
-        <div id="redoc"></div>
-        <script>
-          Redoc.init(${
-      JSON.stringify(schema)
-    }, {}, document.getElementById("redoc"))
-        </script>
-      </body>
-    </html>
-  `,
-    { headers: { "Content-Type": "text/html" } },
-  );
+  if (url.pathname.endsWith("/docs")) {
+    // Render with Redoc
+    return new Response(
+      `<!DOCTYPE html>
+      <html>
+        <head>
+          <title>API Docs</title>
+          <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+        </head>
+        <body>
+          <redoc spec-url="openapi.json"></redoc>
+        </body>
+      </html>`,
+      { headers: { "Content-Type": "text/html" } },
+    );
+  }
+
+  return router.handler(req);
 });
 ```
 
-## Function Generator
+### CLI (separate package)
 
-Quickly create new functions from templates:
-
-```bash
-# Interactive mode
-efr generate
-
-# Or specify template directly
-efr generate --name my-api --template authenticated
-```
-
-Available templates:
-
-- **basic** - Public endpoints with validation
-- **authenticated** - With Supabase auth and RBAC
-- **crud** - Full Create/Read/Update/Delete API
-
-See [CLI Documentation](../router-cli/CLI_README.md) for more details.
+A separate package, `@supabase-router/cli` (`efr`), offers multi-function
+OpenAPI generation (`efr doc-gen` with an `openapi.config.ts`) and function
+templates (`efr generate`). It is not part of `@supabase-router/core`; see
+that package's own documentation.
 
 ## Testing
-
-The package includes comprehensive test coverage with 80%+ for critical modules.
 
 ```bash
 # Run all tests
@@ -791,38 +962,85 @@ deno task test
 # Watch mode
 deno task test:watch
 
-# Run by category
-deno task test:unit
-deno task test:integration
-deno task test:e2e
-
 # With coverage
 deno task test:coverage
 deno task coverage        # Generate LCOV report
 deno task coverage:html   # Generate HTML report
+
+# Integration tests against a throwaway local Supabase stack
+# (requires Docker and the Supabase CLI)
+deno task test:integration
+deno task test:integration --alg RS256   # signing key algorithm (default ES256)
+deno task test:integration --keep        # leave the stack running
+
+# Everything CI runs (fmt, lint, type check, tests)
+deno task ci
 ```
 
-**Test Structure:**
-
-- **Unit tests** (70%) - Security, auth, validation, routing
-- **Integration tests** (20%) - Full router, auth flow, DI
-- **E2E tests** (10%) - CRUD workflows, security scenarios
+Unit and regression tests live in `tests/*_test.ts`. `test:integration` runs
+`tests/integration/run.ts`, which starts a local Supabase stack, serves a
+fixture Edge Function and runs `tests/integration/*_test.ts`. Set
+`SUPABASE_CLI` to use another CLI build (e.g. `SUPABASE_CLI="npx -y
+supabase@beta"`). Other tasks: `check`, `lint`, `lint:complexity`.
 
 See [TESTING.md](./TESTING.md) for complete testing guide.
 
 **For your application:**
 
 ```typescript
-import { createSilentTestContainer } from '../_shared/router/__tests__/helpers/test-containers.ts';
+import { assertEquals } from "@std/assert";
+import {
+  createContainer,
+  defineRoute,
+  defineRouter,
+  type SupabaseClient,
+} from "@supabase-router/core";
 
-Deno.test('my endpoint works', async () => {
-  const router = defineRouter({
-    container: createSilentTestContainer(),
-    routes: [...],
+const env: Record<string, string> = {
+  SUPABASE_URL: "http://localhost:54321",
+  SUPABASE_PUBLISHABLE_KEY: "sb_publishable_test",
+};
+
+// Mock client: the default auth handler verifies tokens with auth.getClaims()
+const mockClient = {
+  auth: {
+    getClaims: async (token: string) =>
+      token === "valid-token"
+        ? { data: { claims: { sub: "user-1", app_metadata: {} } }, error: null }
+        : { data: null, error: { message: "Invalid JWT" } },
+  },
+} as unknown as SupabaseClient;
+
+Deno.test("my endpoint works", async () => {
+  const router = defineRouter<string, { id: string }>({
+    basePath: "/api",
+    container: createContainer({
+      logger: { log: () => {}, error: () => {}, warn: () => {} },
+      env: {
+        get: (key) => env[key],
+        require: (key) => env[key],
+      },
+      supabaseClientFactory: {
+        create: () => mockClient,
+        createWithToken: () => mockClient,
+      },
+    }),
+    routes: [
+      defineRoute({
+        method: "GET",
+        path: "/me",
+        handler: async ({ user }) => ({ id: user.id }),
+      }),
+    ],
   });
-  
-  const response = await router.handler(request);
+
+  const response = await router.handler(
+    new Request("http://localhost/api/me", {
+      headers: { Authorization: "Bearer valid-token" },
+    }),
+  );
   assertEquals(response.status, 200);
+  assertEquals(await response.json(), { id: "user-1" });
 });
 ```
 
@@ -832,7 +1050,7 @@ MIT
 
 ## Contributing
 
-Contributions are welcome! Please read the contributing guidelines first.
+Contributions are welcome! Please open an issue or pull request.
 
 ## Support
 

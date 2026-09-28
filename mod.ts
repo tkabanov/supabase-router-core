@@ -6,7 +6,8 @@
  * and OpenAPI documentation generation.
  *
  * ## Features
- * - **Security hardening** - Protection against path traversal, XSS, prototype pollution
+ * - **Security hardening** - Path traversal and prototype pollution protection,
+ *   fail-closed auth and RBAC, CORS allowlists, constant-time key checks
  * - **Generic types** - Bring your own role system and user type
  * - **Automatic validation** - Zod-based DTO validation
  * - **Built-in authentication** - Automatic auth with RBAC support
@@ -48,13 +49,16 @@
  *
  * @example With custom authentication
  * ```typescript
+ * import { parseBearerToken, unauthorized } from '@supabase-router/core';
+ *
  * const router = defineRouter<MyRoles, MyUser>({
  *   basePath: '/api',
- *   authHandler: async (req: Request, options: AuthOptions<MyRoles>) => {
- *     // Your custom auth logic
- *     const token = req.headers.get('Authorization');
- *     const user = await validateToken(token);
- *     return { user, supabaseClient };
+ *   authHandler: async (req, options) => {
+ *     const token = parseBearerToken(req.headers.get('Authorization'));
+ *     const user = token ? await myVerifyToken(token) : null;
+ *     // Without a user the router answers 401 unless requireUserAuth is false
+ *     if (!user) return { response: unauthorized() };
+ *     return { user, supabaseClient: createUserClient(token!) };
  *   },
  *   routes: [...]
  * });
@@ -63,6 +67,8 @@
 
 // Core types
 export type {
+  AnyCompiledRoute,
+  AnyRouteDef,
   AuthenticatedContext,
   AuthHandler,
   AuthOptions,
@@ -70,15 +76,36 @@ export type {
   BodySchema,
   CompiledRoute,
   CorsConfig,
+  DrizzleInstance,
+  Erased,
+  InferAuthFromRoute,
+  InferBodyFromSchema,
+  InferParamsFromSchema,
+  InferQueryFromSchema,
   Middleware,
   MiddlewareContext,
+  OpenAPIConfig,
+  OpenAPIOperation,
+  OpenAPISchema,
+  PublicContext,
+  RouteAuthModeOf,
+  RouteBodyOf,
   RouteContext,
   RouteDef,
+  RouteDefinitionInput,
+  RouteHandler,
+  RouteParamsOf,
+  RouteQueryOf,
   Router,
   RouterConfig,
+  RouterDatabaseConfig,
+  RouteSchemaDefinition,
   SecurityScheme,
+  TransactionDbClient,
   UserLoader,
 } from "./core/types.ts";
+
+export type { SupabaseClient } from "@supabase/supabase-js";
 
 // Dependency injection container
 export type {
@@ -129,10 +156,14 @@ export {
   sanitizePathParam,
 } from "./security/sanitizer.ts";
 
+export { timingSafeEqual } from "./security/timing.ts";
+
 export {
+  assertValidCorsConfig,
   buildCorsHeaders,
   getDefaultCorsHeaders,
   mergeCorsConfigs,
+  resolveCorsHeaders,
 } from "./security/cors.ts";
 
 // Authentication utilities
@@ -148,9 +179,19 @@ export {
   validateAuthResult,
 } from "./authentication/authenticator.ts";
 
+export type {
+  DefaultAuthOptions,
+  TokenVerification,
+} from "./authentication/default-auth.ts";
+
+export type { SupabaseJwk, SupabaseKeys } from "./core/supabase-keys.ts";
+
+export { resolveSupabaseKeys } from "./core/supabase-keys.ts";
+
 export {
   createDefaultAuthHandler,
   getOrCreateDefaultAuthHandler,
+  parseBearerToken,
 } from "./authentication/default-auth.ts";
 
 // Middleware
@@ -164,7 +205,6 @@ export {
   bodySizeLimitMiddleware,
   errorHandlerMiddleware,
   loggingMiddleware,
-  rateLimitMiddleware,
   requestIdMiddleware,
   timeoutMiddleware,
   timingMiddleware,
@@ -179,11 +219,12 @@ export {
   validateDTO,
 } from "./validation/dto-validator.ts";
 
-export {
-  clearSchemaCache,
-  extractSchema,
-  getGlobalSchemas,
+export type {
+  JsonSchema,
+  SchemaDirection,
 } from "./validation/schema-extractor.ts";
+
+export { extractSchema } from "./validation/schema-extractor.ts";
 
 // OpenAPI generation
 export type { OpenAPISpec } from "./docs/openapi-generator.ts";
@@ -215,9 +256,18 @@ export type { RequestMetadata } from "./core/context.ts";
 export { createRequestMetadata, generateRequestId } from "./core/context.ts";
 
 // Routing utilities (advanced usage)
-export type { CompiledRoutesData } from "./routing/compiler.ts";
+export type {
+  AnyRoute,
+  CompiledRoutesData,
+  RouteMatch,
+} from "./routing/compiler.ts";
 
-export { compileRoute, compileRoutes, matchRoute } from "./routing/compiler.ts";
+export {
+  compileRoute,
+  compileRoutes,
+  matchRoute,
+  matchRouteRaw,
+} from "./routing/compiler.ts";
 
 export { findMatchingRoutes, getAllowedMethods } from "./routing/matcher.ts";
 

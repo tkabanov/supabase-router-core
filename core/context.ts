@@ -2,13 +2,21 @@
  * Request metadata interface
  */
 export interface RequestMetadata {
+  /** Request ID for tracing */
   requestId: string;
+  /** HTTP method */
   method: string;
+  /** Full request URL */
   url: string;
+  /** URL path */
   pathname: string;
+  /** URL query string (including `?`) */
   search: string;
+  /** ISO timestamp when the metadata was created */
   timestamp: string;
+  /** `User-Agent` header */
   userAgent: string | null;
+  /** `Origin` header */
   origin: string | null;
 }
 
