@@ -370,25 +370,24 @@ The integration suite is not part of `deno task ci`.
 
 ## Continuous Integration
 
-```yaml
-# .github/workflows/ci.yml
-name: CI
+Two workflows live in `.github/workflows/`:
 
-on:
-  push:
-    branches: [main]
-  pull_request:
+- `ci.yml` runs `deno task ci` and `deno publish --dry-run` on every push to
+  `main` and on pull requests.
+- `publish.yml` publishes to JSR when a GitHub release is published (the tag
+  must be `v` + the `version` in `deno.json`), or manually from the Actions
+  tab. It authenticates with GitHub OIDC, so no token is stored; the package
+  must be linked to this repository once in its settings on jsr.io.
 
-jobs:
-  ci:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-      - run: deno task ci
-```
+Integration tests are not part of CI because they need Docker and the Supabase
+CLI; run `deno task test:integration` locally before a release.
+
+### Releasing
+
+1. Bump `version` in `deno.json` and add the release section to
+   `CHANGELOG.md`; merge to `main`.
+2. Create a GitHub release with the tag `v<version>` (e.g. `v2.1.0`).
+3. `publish.yml` runs CI and publishes the version to JSR.
 
 ## Resources
 

@@ -1,0 +1,43 @@
+# Publishes @supabase-router/core to JSR with GitHub OIDC (no token needed).
+# One-time setup: link this repository in the package settings on jsr.io
+# (https://jsr.io/@supabase-router/core/settings).
+#
+# Runs when a GitHub release is published (the tag must be v<version> from
+# deno.json), or manually from the Actions tab for an unpublished version.
+name: Publish to JSR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for JSR, also records provenance
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Check release tag matches deno.json version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="v$(jq -r .version deno.json)"
+          if [ "$TAG" != "$version" ]; then
+            echo "::error::Release tag $TAG does not match deno.json version $version"
+            exit 1
+          fi
+
+      - run: deno task ci
+      - run: deno publish
