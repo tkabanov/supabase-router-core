@@ -232,7 +232,9 @@ Deno.serve(router.handler);
 Notes:
 
 - The generics type the user: `defineRouter<Role, User>`. Without them `user` is
-  `unknown`.
+  `unknown`. To define routes in other files, bind the types once with
+  `createRouterKit<{ role: Role; user: User }>()` (see
+  [Router Kit](./README.md#router-kit)).
 - Roles come from `app_metadata.role`, which only the server can set, e.g.
   `supabase.auth.admin.updateUserById(id, { app_metadata: { role: "admin" } })`
   with a secret key. To load users and roles from your own tables instead, pass
@@ -267,6 +269,30 @@ curl http://localhost:54321/functions/v1/api/profile \
 
 From a frontend, `supabase.functions.invoke("api/profile", { method: "GET" })`
 sends the signed-in user's token automatically.
+
+Handlers also get `ctx.auth`, which tells who called: `kind` is `"user"` (with
+`ctx.auth.user`), `"service"` (secret key) or `"anon"`. A route that also
+accepts the secret key, e.g. for a cron job, narrows on it:
+
+```typescript
+defineRoute({
+  method: "POST",
+  path: "/sync",
+  authentication: { bypassWithServiceRole: true }, // user token OR secret key
+  handler: (ctx) => {
+    if (ctx.auth.kind === "service") {
+      return Promise.resolve({ syncedBy: "cron" });
+    }
+    // Use ctx.auth.user here: TypeScript narrows ctx.auth, not ctx.user
+    return Promise.resolve({ syncedBy: ctx.auth.user.id });
+  },
+});
+```
+
+Without bypass flags (as above) `ctx.auth.kind` is always `"user"` and
+`ctx.user` is always set. See
+[Who called the route](./README.md#who-called-the-route-ctxauth) for all
+flags.
 
 ## Adding Multiple Routes
 
@@ -482,7 +508,18 @@ Returning a plain object such as `{ error: "Not found", status: 404 }` does
 
 Unhandled errors return
 `500 {"error":"Internal server error","requestId":"..."}`; the details go to
-`services.logger`, never to the client.
+`services.logger`, never to the client. To send them to an error tracker, add
+`onError` to the router; it may also return a `Response` to replace the 500:
+
+```typescript
+const router = defineRouter({
+  basePath: "/api",
+  onError: (error, { requestId, route }) => {
+    console.error("unhandled", requestId, route?.path, error); // or Sentry etc.
+  },
+  routes: [],
+});
+```
 
 Available helpers (all return a `Response`; error bodies are
 `{"error":"<message>"}`):
@@ -593,7 +630,8 @@ Deno.serve(router.handler);
 ```
 
 Route-level `middlewares` run right before the handler, after authentication and
-validation. Other built-ins: `requestIdMiddleware`, `timeoutMiddleware`,
+validation. All middlewares see `ctx.route` (method, path template such as
+`/api/items/:id`, tags), handy for logs and metrics. Other built-ins: `requestIdMiddleware`, `timeoutMiddleware`,
 `bodySizeLimitMiddleware`, `errorHandlerMiddleware`. For rate limiting, copy
 `examples/redis-rate-limit.ts` (Upstash Redis) into your project.
 

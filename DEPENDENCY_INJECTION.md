@@ -451,11 +451,65 @@ const router = defineRouter<AppRole, AppUser, AppServices>({
 });
 ```
 
+Routes defined outside `defineRouter` (e.g. one file per route) do not get the
+router's generics. Bind the container type once with a router kit instead;
+`HandlerContext` types handlers declared on their own:
+
+```typescript
+// kit.ts
+import {
+  createRouterKit,
+  type HandlerContext,
+  type PublicHandlerContext,
+} from "@supabase-router/core";
+import type { AppServices } from "./container.ts";
+
+export interface App {
+  role: AppRole;
+  user: AppUser;
+  container: AppServices;
+}
+export const kit = createRouterKit<App>();
+
+// routes/invite.ts
+const invite = async ({ services, user }: HandlerContext<App>) => {
+  await services.emailService.sendEmail(user.email, "Invitation", "...");
+  return { sent: true };
+};
+export const inviteRoute = kit.defineRoute({
+  method: "POST",
+  path: "/invite",
+  handler: invite,
+});
+
+// routes/ping.ts
+export const pingRoute = kit.defineRoute({
+  method: "GET",
+  path: "/ping",
+  authRequired: false,
+  handler: async ({ services }: PublicHandlerContext<App>) => {
+    services.analyticsService.track("ping");
+    return { pong: true };
+  },
+});
+
+// index.ts
+const router = kit.defineRouter({
+  basePath: "/api",
+  container: createAppContainer(),
+  routes: [inviteRoute, pingRoute],
+});
+```
+
+See [Router Kit](./README.md#router-kit) for `withAuthDefaults` and custom
+auth types.
+
 ## Testing with DI
 
 The DI system makes testing easy. Export a function that builds the router from
 a container, so tests can pass a container with mocks. Keep the routes inline
-in `defineRouter<..., AppServices>` so `services` stays typed:
+in `defineRouter<..., AppServices>` (or define them with a router kit, see
+above) so `services` stays typed:
 
 ```typescript
 // app.ts
@@ -783,6 +837,7 @@ interface AppServices extends ServiceContainer {
   emailService: EmailService; // Type-safe
 }
 defineRouter<AppRole, AppUser, AppServices>({ ... }); // typed `services`
+createRouterKit<{ container: AppServices }>(); // same, for routes in other files
 
 // Bad
 const services: any = { ... }; // Loses type safety

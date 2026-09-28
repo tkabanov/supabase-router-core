@@ -2,6 +2,32 @@
 
 ## 2.0.0 — unreleased
 
+### Caller context, router kit and hooks
+
+- **`ctx.auth`** on authenticated routes: `{ kind: "user", user }`,
+  `{ kind: "service" }` or `{ kind: "anon" }`, plus `data` from a custom auth
+  handler (`AuthResult.data`). The kind comes from the auth result, so
+  `requireUserAuth: false` without a token is `"anon"`. The admitted kinds are
+  inferred from the route's `authentication` literal: `ctx.user` is `TUser`
+  only on routes without bypass flags; on mixed routes narrow on
+  `ctx.auth.kind` and read `ctx.auth.user`. Explicit generic arguments reject
+  bypass flags instead of silently typing `user` as present.
+- `AuthOptions<TRole, TExt>`: extra `authentication` fields for custom auth
+  handlers, typed end to end.
+- **`createRouterKit<AppTypes>()`** binds role, user, container, auth options
+  and auth data once. `kit.withAuthDefaults(...)` applies router-wide
+  authentication defaults (including `requireServiceRole`) and types routes
+  from the merged options. `HandlerContext` / `PublicHandlerContext` type
+  handlers declared in separate files.
+- `defaultAuthentication` on plain routers for kind-neutral options (e.g.
+  RBAC); caller-kind flags go through `withAuthDefaults`.
+- `ctx.route` (method, path template, tags) in middlewares and
+  `router.match(req)` for tracing and metrics.
+- `onError(error, { req, requestId, route, user })` for unhandled errors; may
+  return a replacement Response.
+- `DEFAULT_CORS_ALLOWED_HEADERS` to extend the default CORS header list.
+- The `requireServiceRole` warning is logged once per router.
+
 ### Supabase API keys and JWT signing keys
 
 Supabase introduced publishable (`sb_publishable_...`) and secret
@@ -120,6 +146,11 @@ of 2026. Both systems are supported:
 - `defaultTags` is optional. Routes remain authenticated by default: public
   routes need `authRequired: false`.
 - `MiddlewareContext` includes `requestId`; `requestIdMiddleware` reuses it.
+- `RouteDef`, `RouteContext`, `RouteHandler` and `RouteDefinitionInput` gained
+  `TAuthOpts` / `TAuthData` generics; `AuthenticatedContext` is deprecated in
+  favour of `UserAuthContext`. Routes with bypass flags must narrow before
+  using the user (see `ctx.auth`).
+- `AuthOptions` is now a type alias over the `BaseAuthOptions` interface.
 - `getOrCreateDbClient` may return a promise; `drizzle-orm` and `postgres` are
   loaded lazily only when the transaction pooler is enabled.
 - The `requireServiceRole` warning is logged once via `services.logger` when the

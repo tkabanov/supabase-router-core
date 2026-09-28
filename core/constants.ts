@@ -30,19 +30,40 @@ export const DEFAULT_SECURITY_HEADERS = {
 } as const;
 
 /**
+ * Request headers allowed by default: everything supabase-js sends
+ * (`x-retry-count` on automatic retries, trace context headers with
+ * `tracePropagation`). Extend it for custom headers:
+ * `allowedHeaders: [...DEFAULT_CORS_ALLOWED_HEADERS, "x-my-header"]`.
+ */
+export const DEFAULT_CORS_ALLOWED_HEADERS: readonly string[] = [
+  "authorization",
+  "x-client-info",
+  "apikey",
+  "content-type",
+  "x-retry-count",
+  "traceparent",
+  "tracestate",
+  "baggage",
+];
+
+/**
  * Default CORS headers for permissive configuration.
  *
  * Allow-Headers covers everything supabase-js sends: `x-retry-count` on
  * automatic retries (enabled by default) and the trace context headers when
  * `tracePropagation` is on.
  */
-export const DEFAULT_CORS_HEADERS = {
+export const DEFAULT_CORS_HEADERS: {
+  readonly "Access-Control-Allow-Origin": "*";
+  readonly "Access-Control-Allow-Methods": string;
+  readonly "Access-Control-Allow-Headers": string;
+  readonly "Access-Control-Max-Age": string;
+} = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type, x-retry-count, traceparent, tracestate, baggage",
+  "Access-Control-Allow-Headers": DEFAULT_CORS_ALLOWED_HEADERS.join(", "),
   "Access-Control-Max-Age": "86400",
-} as const;
+};
 
 /**
  * Dangerous query parameter keys that could lead to prototype pollution

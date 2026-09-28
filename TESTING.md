@@ -239,10 +239,21 @@ tests/
 ├── errors_test.ts             # errorHandlerMiddleware, createErrorResponseByEnv
 ├── doc_comments_test.ts       # no relative imports inside comments (Supabase
 │                              # CLI bundling)
+├── auth_context_test.ts       # ctx.auth kinds at runtime, auth data, custom
+│                              # auth options
+├── auth_types_test.ts         # type-level: ctx.auth / ctx.user per route
+│                              # options, router kit, HandlerContext
+├── router_features_test.ts    # defaultAuthentication, withAuthDefaults,
+│                              # ctx.route, router.match, onError
+├── rate_limit_example_test.ts # examples/redis-rate-limit.ts with a fake limiter
 └── integration/               # real Supabase stack, see below
 ```
 
 `examples/testing-example.ts` also runs as part of `deno task test`.
+
+`auth_types_test.ts` asserts types rather than behaviour: `assertType<IsExact<...>>`
+and `// @ts-expect-error` lines are verified by `deno task check` (part of
+`deno task ci`); an `@ts-expect-error` whose error disappears fails the check.
 
 `tests/helpers.ts` provides:
 

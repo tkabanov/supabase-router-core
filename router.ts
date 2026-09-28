@@ -1,6 +1,7 @@
 import type {
   AnyRouteDef,
   AuthHandler,
+  AuthOptions,
   ErrorSchemaDefinition,
   RouteBodyOf,
   RouteDef,
@@ -10,6 +11,7 @@ import type {
   Router,
   RouterConfig,
   RouteSchemaDefinition,
+  UserOnlyAuthOptions,
 } from "./core/types.ts";
 import { compileRoutes } from "./routing/compiler.ts";
 import { generateOpenAPISpec } from "./docs/openapi-generator.ts";
@@ -18,7 +20,11 @@ import { DEFAULT_ERROR_SCHEMAS } from "./errors/http-errors.ts";
 import { getOrCreateDefaultAuthHandler } from "./authentication/default-auth.ts";
 import { createContainer, type ServiceContainer } from "./core/container.ts";
 import { installTransactionPoolerClient } from "./database/pooler.ts";
-import { createRequestHandler, type PipelineRoute } from "./core/pipeline.ts";
+import {
+  createRequestHandler,
+  createRouteMatcher,
+  type PipelineRoute,
+} from "./core/pipeline.ts";
 
 /**
  * Define a route with type inference
@@ -45,6 +51,9 @@ export function defineRoute<
   TSchema extends RouteSchemaDefinition | undefined = undefined,
   TAuth extends boolean = true,
   TContainer extends ServiceContainer = ServiceContainer,
+  // `const` keeps literal flags (`bypassWithServiceRole: true`), which decide
+  // the type of ctx.auth / ctx.user
+  const TAuthOpts extends AuthOptions<TRole> = UserOnlyAuthOptions<TRole>,
 >(
   // Handler params/query/body types are inferred from TSchema
   def: RouteDefinitionInput<
@@ -55,7 +64,8 @@ export function defineRoute<
     RouteParamsOf<TSchema>,
     RouteQueryOf<TSchema>,
     RouteBodyOf<TSchema>,
-    TContainer
+    TContainer,
+    TAuthOpts
   >,
 ): RouteDef<
   TRole,
@@ -63,10 +73,11 @@ export function defineRoute<
   RouteParamsOf<TSchema>,
   RouteQueryOf<TSchema>,
   RouteBodyOf<TSchema>,
-  // Without NoInfer, TAuth would be inferred as `boolean` from the router's
-  // routes array, making `user` optional in every authenticated handler
+  // Without NoInfer, TAuth and TAuthOpts would be inferred from the router's
+  // routes array (boolean / any), which would loosen the handler context
   NoInfer<TAuth>,
-  TContainer
+  TContainer,
+  NoInfer<TAuthOpts>
 > {
   return {
     ...def,
@@ -78,7 +89,8 @@ export function defineRoute<
     RouteQueryOf<TSchema>,
     RouteBodyOf<TSchema>,
     TAuth,
-    TContainer
+    TContainer,
+    TAuthOpts
   >;
 }
 
@@ -91,6 +103,25 @@ const buildThrowers = (
       definition.throw(...args);
   }
   return throwers;
+};
+
+type DefaultAuthentication = RouterConfig["defaultAuthentication"];
+
+/**
+ * Router defaults under the route's own options (shallow, route wins).
+ * `allowedMethods` is never taken from the defaults.
+ */
+const mergeAuthentication = (
+  route: AnyRouteDef,
+  defaults: DefaultAuthentication,
+): AnyRouteDef["authentication"] => {
+  if (!defaults || route.authRequired === false) {
+    return route.authentication;
+  }
+  const { allowedMethods: _ignored, ...routerDefaults } = defaults as {
+    allowedMethods?: string[];
+  };
+  return { ...routerDefaults, ...route.authentication };
 };
 
 const buildAuthOptions = (
@@ -118,10 +149,22 @@ const assertRouteConfig = (
   }
 
   assertValidCorsConfig(route.corsHeaders);
+};
 
-  if (route.authentication?.requireServiceRole) {
+/** One warning per router listing every route that requires the secret key */
+const warnAboutServiceRoleRoutes = (
+  routes: AnyRouteDef[],
+  container: ServiceContainer,
+): void => {
+  const names = routes
+    .filter((r) => r.authRequired !== false)
+    .filter((r) => r.authentication?.requireServiceRole)
+    .map((r) => `${r.method} ${r.fullPath}`);
+  if (names.length > 0) {
     container.logger.warn(
-      `Route "${route.method} ${fullPath}" uses requireServiceRole. It bypasses RLS and must never be called from frontend code.`,
+      `Routes requiring the secret key (they bypass RLS and must never be called from frontend code): ${
+        names.join(", ")
+      }`,
     );
   }
 };
@@ -133,19 +176,28 @@ const mergeErrorSchemas = (
   ...(route.errorSchemas ?? {}),
 });
 
+interface RouteDefaults {
+  tags: string[];
+  authentication: DefaultAuthentication;
+}
+
 const prepareRoute = (
-  route: AnyRouteDef,
-  defaultTags: string[],
+  definition: AnyRouteDef,
+  defaults: RouteDefaults,
   container: ServiceContainer,
 ): PipelineRoute => {
-  const fullPath = route.path ?? route.fullPath;
+  const fullPath = definition.path ?? definition.fullPath;
+  const route: AnyRouteDef = {
+    ...definition,
+    authentication: mergeAuthentication(definition, defaults.authentication),
+  };
   assertRouteConfig(route, fullPath, container);
   const errorSchemas = mergeErrorSchemas(route);
 
   return {
     ...route,
     fullPath,
-    tags: [...defaultTags, ...(route.tags ?? [])],
+    tags: [...defaults.tags, ...(route.tags ?? [])],
     errorSchemas,
     authRequired: route.authRequired ?? true,
     includeDefaultErrors: route.includeDefaultErrors ?? true,
@@ -217,20 +269,26 @@ export function defineRouter<
         tokenVerification: config.tokenVerification,
       });
 
+  const defaults: RouteDefaults = {
+    tags: config.defaultTags ?? [],
+    authentication: config.defaultAuthentication as DefaultAuthentication,
+  };
   const compiledRoutes = compileRoutes(
     config.basePath,
-    config.routes.map((route) =>
-      prepareRoute(route, config.defaultTags ?? [], container)
-    ),
+    config.routes.map((route) => prepareRoute(route, defaults, container)),
   );
+  warnAboutServiceRoleRoutes(compiledRoutes.routes, container);
 
-  const handler = createRequestHandler({
+  const pipeline = {
     routes: compiledRoutes,
     container,
     corsHeaders: config.corsHeaders,
     middlewares: config.middlewares ?? [],
     getAuthHandler,
-  });
+    onError: config.onError,
+  };
+  const handler = createRequestHandler(pipeline);
+  const match = createRouteMatcher(pipeline);
 
   const openapi = () =>
     generateOpenAPISpec(compiledRoutes, {
@@ -240,5 +298,5 @@ export function defineRouter<
       securitySchemes: config.securitySchemes,
     });
 
-  return { handler, openapi };
+  return { handler, match, openapi };
 }

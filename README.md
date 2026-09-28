@@ -18,7 +18,9 @@ documentation generation.
 - **Built-in authentication** - Supabase Auth by default, with flexible RBAC
 - **OpenAPI generation** - `router.openapi()` builds the spec from your routes
 - **Middleware support** - Composable request/response middleware
-- **Type-safe handlers** - Full type inference from schemas to handlers
+- **Type-safe handlers** - Full type inference from schemas to handlers, and a
+  typed `ctx.auth` telling users, secret-key services and anonymous callers
+  apart
 - **Dependency injection** - Easy testing and service injection
 - **Lightweight core** - Minimal runtime deps with optional Drizzle-based DB
   access
@@ -186,7 +188,9 @@ defineRoute({
 The router infers full types for `params`, `query`, `body`, and `user`
 automatically from your Zod schemas and the router's generics
 (`defineRouter<Role, User>`), so handler destructuring works without manual
-annotations. Without the generics, `user` is typed as `unknown`.
+annotations. Without the generics, `user` is typed as `unknown`. For routes
+defined outside `defineRouter` (e.g. one file per route), bind the types once
+with a [router kit](#router-kit).
 
 - Routes require authentication by default (`authRequired` defaults to
   `true`). Public routes must set `authRequired: false`; there `user` is not
@@ -268,7 +272,8 @@ const router = defineRouter<ProjectRoles, MyUser>({
 2. Builds the user from `app_metadata` plus `id`, `email`, `user_metadata` and
    `is_anonymous` (or calls `userLoader(userId, client)`)
 3. Checks RBAC if `allowedRoles` specified
-4. Provides `user` and a user-scoped `supabaseClient` to handlers (RLS active)
+4. Provides `user` (also as `ctx.auth.user`) and a user-scoped
+   `supabaseClient` to handlers (RLS active)
 
 #### Custom Authentication
 
@@ -315,13 +320,57 @@ const router = defineRouter<ProjectRoles, MyUser>({
 });
 ```
 
+A custom handler can take extra `authentication` fields and return extra data:
+every field of a route's `authentication` is passed to it as `options`
+(`AuthOptions<TRole, TExt>`), and `AuthResult.data` is exposed as
+`ctx.auth.data`. Declare both types once with a [router kit](#router-kit):
+
+```typescript
+import { createRouterKit, unauthorized } from "@supabase-router/core";
+
+const kit = createRouterKit<{
+  role: ProjectRoles;
+  user: MyUser;
+  authOptions: { freshUser?: boolean }; // extra `authentication` fields
+  authData: { sessionId: string }; // type of AuthResult.data / ctx.auth.data
+}>();
+
+const router = kit.defineRouter({
+  basePath: "/api",
+  authHandler: async (req, options) => {
+    // Your logic; options.freshUser is typed boolean | undefined
+    const session = await loadSession(req, { fresh: options.freshUser });
+    if (!session) {
+      return { response: unauthorized("Invalid token") };
+    }
+    return {
+      user: session.user,
+      supabaseClient: session.client,
+      data: { sessionId: session.id },
+    };
+  },
+  routes: [
+    kit.defineRoute({
+      method: "DELETE",
+      path: "/account",
+      authentication: { freshUser: true },
+      handler: async (ctx) => ({
+        deleted: ctx.user.id,
+        session: ctx.auth.data?.sessionId,
+      }),
+    }),
+  ],
+});
+```
+
 #### Secret Key (Service Role) and Publishable Key (Anon)
 
 ⚠️ **SECURITY WARNING**: `requireServiceRole` should **NEVER** be used for
 frontend-accessible endpoints. Secret (service role) keys bypass Row Level
 Security (RLS) and have full database access. Only use this for
-internal/admin operations or server-to-server communication. The router logs
-a warning once via `services.logger` when it is created with such a route.
+internal/admin operations or server-to-server communication. When a router is
+created with such routes, it logs one warning via `services.logger` listing
+them.
 
 Send secret keys on the `apikey` header (recommended by Supabase); the router
 also accepts them, and legacy `service_role` JWTs, on
@@ -354,15 +403,15 @@ defineRoute({
   authentication: {
     bypassWithServiceRole: true,
   },
-  handler: async ({ user, supabaseClient, serviceRoleClient }) => {
-    // With the secret key, serviceRoleClient is set and `user` is undefined
-    // (despite its type), so check serviceRoleClient first
-    if (serviceRoleClient) {
+  handler: async (ctx) => {
+    // ctx.auth.kind is "user" | "service"; with the secret key there is no
+    // user and serviceRoleClient is set
+    if (ctx.auth.kind === "service") {
       return { caller: "service" };
     }
-    // Otherwise a user token was sent: supabaseClient is user-scoped (RLS)
-    const { data } = await supabaseClient.from("reports").select();
-    return { caller: user.id, reports: data };
+    // A user token was sent: supabaseClient is user-scoped (RLS)
+    const { data } = await ctx.supabaseClient.from("reports").select();
+    return { caller: ctx.auth.user.id, reports: data };
   },
 });
 
@@ -373,15 +422,43 @@ defineRoute({
   authentication: {
     bypassWithAnonRole: true,
   },
-  handler: async ({ user }) => {
+  handler: async ({ auth }) => {
     // Accepts a publishable/anon key on `apikey` or `Authorization`. These
     // keys ship with every frontend, so the route is effectively public:
-    // `user` is undefined for key-only callers, and RBAC rejects them.
+    // key-only callers are "anon" (no user), and RBAC rejects them.
     // A valid user token still takes precedence.
-    return { signedIn: Boolean(user) };
+    return { signedIn: auth.kind === "user" };
   },
 });
 ```
+
+#### Who called the route (`ctx.auth`)
+
+Authenticated handlers receive `ctx.auth`, a union narrowed on `kind`:
+`{ kind: "user", user, data? }`, `{ kind: "service", data? }` or
+`{ kind: "anon", data? }`. The kind comes from the authentication result: the
+secret key gives `"service"`, a signed-in user `"user"`, anything else `"anon"`
+(e.g. `requireUserAuth: false` without a token, or `bypassWithAnonRole`).
+
+The kinds a route admits are inferred from its `authentication` literal:
+
+| `authentication`                                      | `ctx.auth.kind`        | `ctx.user`              |
+| ----------------------------------------------------- | ---------------------- | ----------------------- |
+| no caller flags (default)                             | `"user"`               | `TUser`                 |
+| `bypassWithServiceRole: true`                         | `"user" \| "service"` | `TUser \| undefined`   |
+| `requireServiceRole: true`                            | `"service"`            | `undefined`             |
+| `bypassWithAnonRole: true` / `requireUserAuth: false` | `"user" \| "anon"`    | `TUser \| undefined`   |
+
+- TypeScript narrows `ctx.auth`, not `ctx`: after
+  `if (ctx.auth.kind === "user")` use `ctx.auth.user` (typed `TUser`);
+  `ctx.user` stays `TUser | undefined`.
+- The literal is only inferred when `defineRoute` gets no explicit type
+  arguments. With `defineRoute<Role, User>(...)`, `authentication` is typed as
+  "users only", so bypass flags are a compile error (unless you also pass its
+  type, the sixth type argument). Define routes inline in
+  `defineRouter<Role, User>` or use a [router kit](#router-kit) instead.
+- Public routes (`authRequired: false`) have no `ctx.auth`. Middlewares see
+  `ctx.auth?: CallerInfo` once authentication ran.
 
 #### Per-route auth configuration
 
@@ -403,6 +480,142 @@ defineRoute({
 
 `allowedRoles` on the route is a shorthand for `requireRBAC` +
 `authentication.allowedRoles`. RBAC always needs a user and fails closed.
+
+#### Router-wide defaults (`defaultAuthentication`)
+
+`defaultAuthentication` is merged under the `authentication` of every
+authenticated route (shallow; the route wins):
+
+```typescript
+const adminRouter = defineRouter<ProjectRoles, MyUser>({
+  basePath: "/admin",
+  defaultAuthentication: {
+    requireRBAC: true,
+    allowedRoles: [ProjectRoles.ADMIN],
+  },
+  routes: [
+    // Admins only (from the defaults)
+    defineRoute({
+      method: "GET",
+      path: "/stats",
+      handler: async () => ({ ok: true }),
+    }),
+    // Overrides allowedRoles; requireRBAC still comes from the defaults
+    defineRoute({
+      method: "GET",
+      path: "/me",
+      authentication: { allowedRoles: [ProjectRoles.ADMIN, ProjectRoles.USER] },
+      handler: async ({ user }) => ({ id: user.id }),
+    }),
+  ],
+});
+```
+
+- Ignored for `authRequired: false` routes; `allowedMethods` is never taken
+  from the defaults; `authentication: {}` on a route does not reset them.
+- It only accepts options that do not change the caller kind (RBAC, and on
+  kit routers the custom `authOptions` fields). Caller-kind flags
+  (`requireServiceRole`, `bypassWithServiceRole`, `bypassWithAnonRole`,
+  `requireUserAuth`) must go through `kit.withAuthDefaults()` (see
+  [Router kit](#router-kit)), otherwise the route types could not see them.
+- A default `requireRBAC: true` makes routes without roles answer
+  `403 No roles configured`.
+
+### Router Kit
+
+`createRouterKit<AppTypes>()` binds your role, user, container and custom auth
+types once, so routes defined outside `defineRouter<...>` (e.g. in other
+files) are typed without generic arguments:
+
+```typescript
+// kit.ts
+import { createRouterKit } from "@supabase-router/core";
+
+export interface App {
+  role: ProjectRoles;
+  user: MyUser;
+  container: AppServices; // optional: typed ctx.services
+  // authOptions / authData: see Custom Authentication
+}
+
+export const kit = createRouterKit<App>();
+export const { defineRoute, defineRouter } = kit;
+```
+
+`kit.withAuthDefaults(defaults)` returns a kit whose routers apply the defaults
+to every authenticated route and whose `defineRoute` types `ctx.auth` from the
+merged options. This is the way to default caller-kind flags:
+
+```typescript
+const service = kit.withAuthDefaults({ requireServiceRole: true });
+
+export const tasksRouter = service.defineRouter({
+  basePath: "/tasks",
+  routes: [
+    service.defineRoute({
+      method: "POST",
+      path: "/run",
+      // ctx.auth.kind is "service"
+      handler: async ({ serviceRoleClient }) => {
+        await serviceRoleClient!.rpc("run_tasks");
+        return { ran: true };
+      },
+    }),
+    service.defineRoute({
+      method: "GET",
+      path: "/mine",
+      authentication: { requireServiceRole: false }, // users only
+      handler: async ({ user }) => ({ id: user.id }),
+    }),
+  ],
+});
+```
+
+For handlers declared in their own files, `HandlerContext<App, typeof schema>`
+types the context (a third argument gives the effective `authentication`,
+e.g. `{ requireServiceRole: true }`); `PublicHandlerContext<App, typeof schema>`
+is the counterpart for `authRequired: false` routes:
+
+```typescript
+import {
+  type HandlerContext,
+  notFound,
+  type PublicHandlerContext,
+} from "@supabase-router/core";
+import { z } from "zod";
+import { type App, kit } from "./kit.ts";
+
+const itemSchema = { params: z.object({ id: z.uuid() }) };
+
+const getItem = async (ctx: HandlerContext<App, typeof itemSchema>) => {
+  const { data } = await ctx.supabaseClient
+    .from("items")
+    .select()
+    .eq("id", ctx.params.id)
+    .eq("owner_id", ctx.user.id)
+    .maybeSingle();
+  return data ?? notFound("Item not found");
+};
+
+const health = async (_ctx: PublicHandlerContext<App>) => ({ ok: true });
+
+export const routes = [
+  kit.defineRoute({
+    method: "GET",
+    path: "/items/:id",
+    requestSchema: itemSchema,
+    handler: getItem,
+  }),
+  kit.defineRoute({
+    method: "GET",
+    path: "/health",
+    authRequired: false,
+    handler: health,
+  }),
+];
+```
+
+Don't pass type arguments to `kit.defineRoute`: they are inferred.
 
 ### Validation
 
@@ -500,13 +713,17 @@ route match → global middlewares → auth → params → query → body → db
   (`405`) are answered **before** global middlewares run.
 - **Global** middlewares wrap the rest of the pipeline, so rate limiting, body
   size limits, timeouts and error handling also cover unauthenticated and
-  invalid requests. `ctx.user`, `ctx.body` and `ctx.db` are populated only
-  after `await next()`.
-- **Route** middlewares run right before the handler; `ctx.user`,
+  invalid requests. `ctx.user`, `ctx.auth`, `ctx.body` and `ctx.db` are
+  populated only after `await next()`.
+- **Route** middlewares run right before the handler; `ctx.user`, `ctx.auth`,
   `ctx.supabaseClient`, `ctx.serviceRoleClient`, `ctx.body` and `ctx.db` are
   available.
+- Both see `ctx.route`, the matched route as declared: `method`, `path`
+  template including `basePath` (e.g. `/api/users/:id`) and `tags` (including
+  `defaultTags`).
 - Unhandled errors are logged via `services.logger` and returned as a generic
-  `500 { error: "Internal server error", requestId }`.
+  `500 { error: "Internal server error", requestId }` (see
+  [`onError`](#error-handling) to report or replace it).
 
 #### Rate Limiting
 
@@ -552,9 +769,36 @@ const requestLogger: Middleware = async (ctx, next) => {
 
   const response = await next();
 
-  ctx.services.logger.log(`Response: ${response.status} (${ctx.requestId})`);
+  // ctx.route.path is the template ("/api/users/:id"), handy for metrics;
+  // ctx.auth is set once authentication ran
+  ctx.services.logger.log(
+    `Response: ${response.status} ${ctx.route.method} ${ctx.route.path}`,
+    { requestId: ctx.requestId, caller: ctx.auth?.kind },
+  );
   return response;
 };
+```
+
+#### Matching before handling (`router.match`)
+
+`router.match(req)` returns the `RouteInfo` (`method`, `path`, `tags`) that
+`router.handler` would dispatch to, using the same matching (`HEAD` → `GET`,
+optional trailing slash), or `null` for `OPTIONS`, `404` and `405`. Use it to
+name tracing spans by route template before handling the request:
+
+```typescript
+Deno.serve((req) => {
+  const route = router.match(req);
+  const name = route ? `${route.method} ${route.path}` : req.method;
+  // e.g. an OpenTelemetry tracer
+  return tracer.startActiveSpan(name, async (span) => {
+    try {
+      return await router.handler(req);
+    } finally {
+      span.end();
+    }
+  });
+});
 ```
 
 ### Error Handling
@@ -591,7 +835,36 @@ returned as JSON with `X-Content-Type-Options: nosniff`; they are not
 HTML-escaped, so escape them if you render them as HTML.
 
 Unhandled errors return a generic `500` with a `requestId`; details only go to
-`services.logger`. `errorHandlerMiddleware(isDevelopment)` and
+`services.logger`. To report them (or answer differently), add `onError` to the
+router:
+
+```typescript
+const router = defineRouter<ProjectRoles, MyUser>({
+  basePath: "/api",
+  onError: async (error, { req, requestId, route, user }) => {
+    await reportError(error, {
+      url: req.url,
+      requestId,
+      route: route?.path,
+      userId: user?.id, // undefined if the error happened before auth
+    });
+    // Optional: return a Response to replace the generic 500
+    return Response.json({ error: "Please try again", requestId }, {
+      status: 503,
+    });
+  },
+  routes: [],
+});
+```
+
+- Called for unhandled errors (not thrown `Response`s), after
+  `services.logger.error`. CORS headers are still added to its `Response`;
+  returning nothing keeps the generic `500`, and a throwing hook falls back to
+  it.
+- Not called when a middleware such as `errorHandlerMiddleware` or `catchErrors`
+  already handled the error.
+
+`errorHandlerMiddleware(isDevelopment)` and
 `createErrorResponseByEnv(error, isDevelopment)` include the real message (and
 stack) only when `isDevelopment` is `true`, and a generic message otherwise.
 
@@ -600,6 +873,12 @@ stack) only when `isDevelopment` is `true`, and a generic message otherwise.
 Configure CORS globally or per-route:
 
 ```typescript
+import {
+  DEFAULT_CORS_ALLOWED_HEADERS,
+  defineRoute,
+  defineRouter,
+} from "@supabase-router/core";
+
 const router = defineRouter({
   basePath: "/api",
 
@@ -607,7 +886,8 @@ const router = defineRouter({
   corsHeaders: {
     allowedOrigins: ["https://example.com", "https://app.example.com"],
     allowedMethods: ["GET", "POST", "PUT", "DELETE"],
-    // allowedHeaders omitted: defaults cover the supabase-js headers
+    // Omit allowedHeaders to allow only the supabase-js headers
+    allowedHeaders: [...DEFAULT_CORS_ALLOWED_HEADERS, "x-tenant-id"],
     credentials: true,
   },
 
@@ -631,10 +911,10 @@ const router = defineRouter({
 - Without any configuration, permissive defaults (`*`) are used.
 - A route-level `corsHeaders` **replaces** (does not merge with) the router
   config.
-- If `allowedHeaders` is omitted, the default list is used: `authorization`,
-  `x-client-info`, `apikey`, `content-type`, `x-retry-count`, `traceparent`,
-  `tracestate`, `baggage` (what supabase-js sends). If you set it, include
-  those headers.
+- If `allowedHeaders` is omitted, `DEFAULT_CORS_ALLOWED_HEADERS` is used:
+  `authorization`, `x-client-info`, `apikey`, `content-type`, `x-retry-count`,
+  `traceparent`, `tracestate`, `baggage` (what supabase-js sends). If you set
+  it, extend that list as above rather than replacing it.
 - Allowlisted origins are echoed back with `Vary: Origin`; other origins get
   no `Access-Control-Allow-Origin`. `allowedOrigins: "*"` with
   `credentials: true` throws when the router is created.
@@ -723,6 +1003,9 @@ const router = defineRouter<ProjectRoles, MyUser, AppServices>({
   ],
 });
 ```
+
+With a [router kit](#router-kit), declare the container type once instead:
+`createRouterKit<{ role: ProjectRoles; user: MyUser; container: AppServices }>()`.
 
 ### Testing with Mocks
 

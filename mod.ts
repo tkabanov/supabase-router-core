@@ -67,17 +67,27 @@
 
 // Core types
 export type {
+  AnonAuthContext,
+  AnonCaller,
   AnyCompiledRoute,
   AnyRouteDef,
+  AuthContextOf,
   AuthenticatedContext,
   AuthHandler,
+  AuthKind,
+  AuthKindsOf,
   AuthOptions,
   AuthResult,
+  BaseAuthOptions,
   BodySchema,
+  CallerInfo,
+  CallerKindFlag,
   CompiledRoute,
   CorsConfig,
   DrizzleInstance,
+  EmptyObject,
   Erased,
+  FlagMayBe,
   InferAuthFromRoute,
   InferBodyFromSchema,
   InferParamsFromSchema,
@@ -94,15 +104,23 @@ export type {
   RouteDef,
   RouteDefinitionInput,
   RouteHandler,
+  RouteInfo,
   RouteParamsOf,
   RouteQueryOf,
   Router,
+  RouterAuthDefaults,
   RouterConfig,
   RouterDatabaseConfig,
+  RouterErrorInfo,
   RouteSchemaDefinition,
   SecurityScheme,
+  ServiceAuthContext,
+  ServiceCaller,
   TransactionDbClient,
+  UserAuthContext,
+  UserCaller,
   UserLoader,
+  UserOnlyAuthOptions,
 } from "./core/types.ts";
 
 export type { SupabaseClient } from "@supabase/supabase-js";
@@ -126,6 +144,28 @@ export {
 
 // Router functions
 export { defineRoute, defineRouter } from "./router.ts";
+
+// Router kit: bind app types once
+export type {
+  AppAuthDefaults,
+  AppAuthOptions,
+  AppTypes,
+  AuthDataOf,
+  AuthExtOf,
+  BoundRouterKit,
+  ContainerOf,
+  HandlerContext,
+  KitRouteDef,
+  KitRouteInput,
+  KitRouterConfig,
+  MergeAuthOptions,
+  PublicHandlerContext,
+  RoleOf,
+  RouterKit,
+  UserOf,
+} from "./router-kit.ts";
+
+export { createRouterKit } from "./router-kit.ts";
 
 // HTTP error responses
 export type { ErrorSchemaDefinition } from "./core/types.ts";
@@ -238,6 +278,7 @@ export {
 // Constants
 export {
   DANGEROUS_QUERY_KEYS,
+  DEFAULT_CORS_ALLOWED_HEADERS,
   DEFAULT_CORS_HEADERS,
   DEFAULT_MAX_FILE_SIZE,
   DEFAULT_SECURITY_HEADERS,

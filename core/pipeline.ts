@@ -2,10 +2,14 @@ import type {
   AnyCompiledRoute,
   AuthHandler,
   AuthOptions,
+  AuthResult,
+  CallerInfo,
   CorsConfig,
   Erased,
   Middleware,
   MiddlewareContext,
+  RouteInfo,
+  RouterErrorInfo,
   ServiceContainer,
 } from "./types.ts";
 import type { ZodTypeAny } from "zod";
@@ -46,6 +50,11 @@ export interface PipelineConfig {
   corsHeaders?: CorsConfig | Record<string, string>;
   middlewares: Middleware<Erased, Erased>[];
   getAuthHandler: () => Promise<AuthHandler<Erased, Erased>>;
+  /** Called for unhandled errors; may return a replacement Response */
+  onError?: (
+    error: unknown,
+    info: RouterErrorInfo<Erased>,
+  ) => void | Response | Promise<void | Response>;
 }
 
 type Context = MiddlewareContext<unknown, ServiceContainer>;
@@ -117,6 +126,19 @@ const validateInto = (
   return undefined;
 };
 
+/**
+ * Decided by the result, not the route's flags: `requireUserAuth: false`
+ * without a token is "anon" even though no bypass was used.
+ */
+const toCaller = (result: AuthResult<unknown>): CallerInfo => {
+  if (result.serviceBypassed) {
+    return { kind: "service", data: result.data };
+  }
+  return result.user
+    ? { kind: "user", user: result.user, data: result.data }
+    : { kind: "anon", data: result.data };
+};
+
 const authStep: Step = async ({ ctx, route }, config) => {
   if (!route.authRequired) {
     try {
@@ -146,6 +168,7 @@ const authStep: Step = async ({ ctx, route }, config) => {
   ctx.user = result.user;
   ctx.supabaseClient = result.supabaseClient;
   ctx.serviceRoleClient = result.serviceRoleClient;
+  ctx.auth = toCaller(result);
   return undefined;
 };
 
@@ -343,6 +366,7 @@ const handleMatched = async (
   const ctx: Context = {
     req,
     requestId: container.idGenerator.generate(),
+    route: toRouteInfo(match.route),
     params: {},
     query: {},
     body: undefined,
@@ -362,8 +386,9 @@ const handleMatched = async (
         ctx,
         () => catchThrownResponse(() => runRoute(state, config)),
       ),
-    container,
-    ctx.requestId,
+    config,
+    // Read lazily: the user is only known once authentication ran
+    () => ({ req, requestId: ctx.requestId, route: ctx.route, user: ctx.user }),
   );
 
   const cors = resolveCorsHeaders(
@@ -374,14 +399,35 @@ const handleMatched = async (
   return withHeaders(response, cors, req.method === "HEAD");
 };
 
+const genericError = (requestId?: string): Response =>
+  json(500, { error: "Internal server error", requestId });
+
+/** Let `onError` replace the generic 500; a failing hook never escapes */
+const callOnError = async (
+  error: unknown,
+  config: PipelineConfig,
+  info: RouterErrorInfo<Erased>,
+): Promise<Response> => {
+  try {
+    const replacement = await config.onError?.(error, info);
+    if (replacement instanceof Response) {
+      return replacement;
+    }
+  } catch (hookError) {
+    config.container.logger.error("onError hook failed", hookError);
+  }
+  return genericError(info.requestId);
+};
+
 /**
  * Last line of defence: never let an exception escape to the runtime.
- * Details are logged; the client only gets a generic message and request ID.
+ * Details are logged and passed to `onError`; by default the client only
+ * gets a generic message and the request ID.
  */
 const runSafely = async (
   run: () => Promise<Response>,
-  container: ServiceContainer,
-  requestId?: string,
+  config: PipelineConfig,
+  getInfo: () => RouterErrorInfo<Erased>,
 ): Promise<Response> => {
   try {
     return await run();
@@ -389,13 +435,41 @@ const runSafely = async (
     if (error instanceof Response) {
       return error;
     }
-    container.logger.error("Unhandled error while processing request", {
-      requestId,
+    const info = getInfo();
+    config.container.logger.error("Unhandled error while processing request", {
+      requestId: info.requestId,
       error,
     });
-    return json(500, { error: "Internal server error", requestId });
+    return await callOnError(error, config, info);
   }
 };
+
+const toRouteInfo = (route: PipelineRoute): RouteInfo => ({
+  method: route.method,
+  path: route.fullPath,
+  tags: route.tags ?? [],
+});
+
+/**
+ * Create `router.match`: the route `handler` would dispatch a request to
+ * @param config - Compiled routes
+ * @returns Matcher returning null for OPTIONS, 404 and 405
+ */
+export function createRouteMatcher(
+  config: Pick<PipelineConfig, "routes">,
+): (req: Request) => RouteInfo | null {
+  return (req) => {
+    if (req.method === "OPTIONS") {
+      return null;
+    }
+    const match = findRoute(
+      req.method,
+      new URL(req.url).pathname,
+      config as PipelineConfig,
+    );
+    return match ? toRouteInfo(match.route as PipelineRoute) : null;
+  };
+}
 
 /**
  * Create the router's request handler
@@ -406,25 +480,29 @@ export function createRequestHandler(
   config: PipelineConfig,
 ): (req: Request) => Promise<Response> {
   return (req) =>
-    runSafely(() => {
-      const url = new URL(req.url);
+    runSafely(
+      () => {
+        const url = new URL(req.url);
 
-      if (req.method === "OPTIONS") {
-        return Promise.resolve(handlePreflight(req, url.pathname, config));
-      }
+        if (req.method === "OPTIONS") {
+          return Promise.resolve(handlePreflight(req, url.pathname, config));
+        }
 
-      const match = findRoute(req.method, url.pathname, config);
-      if (!match) {
-        return Promise.resolve(handleUnmatched(req, url.pathname, config));
-      }
+        const match = findRoute(req.method, url.pathname, config);
+        if (!match) {
+          return Promise.resolve(handleUnmatched(req, url.pathname, config));
+        }
 
-      return handleMatched(
-        req,
-        url,
-        match as typeof match & {
-          route: PipelineRoute;
-        },
-        config,
-      );
-    }, config.container);
+        return handleMatched(
+          req,
+          url,
+          match as typeof match & {
+            route: PipelineRoute;
+          },
+          config,
+        );
+      },
+      config,
+      () => ({ req }),
+    );
 }

@@ -64,7 +64,7 @@ export interface OpenAPIOperation {
  * };
  * ```
  */
-export interface AuthOptions<TRole = string> {
+export interface BaseAuthOptions<TRole = string> {
   /** HTTP methods allowed for this route */
   allowedMethods?: string[];
   /**
@@ -135,12 +135,65 @@ export interface AuthOptions<TRole = string> {
   allowedRoles?: TRole[];
 }
 
+/** Object type without properties (default for extension points) */
+export type EmptyObject = Record<never, never>;
+
+/**
+ * Authentication options, optionally extended with project-specific fields
+ * (`TExt`) that a custom `authHandler` understands, e.g. `{ freshUser?: boolean }`.
+ * All fields of a route's `authentication` are passed to the auth handler.
+ */
+export type AuthOptions<
+  TRole = string,
+  TExt extends object = EmptyObject,
+> = BaseAuthOptions<TRole> & TExt;
+
+/** Flags that decide which kinds of callers a route admits */
+export type CallerKindFlag =
+  | "requireServiceRole"
+  | "bypassWithServiceRole"
+  | "bypassWithAnonRole"
+  | "requireUserAuth";
+
+/**
+ * Default type of a route's `authentication` when it is not inferred (e.g.
+ * explicit generic arguments): only signed-in users. Routes with bypass
+ * flags must let TypeScript infer the literal (or pass it explicitly), so
+ * `ctx.auth` is typed honestly.
+ */
+export type UserOnlyAuthOptions<
+  TRole = string,
+  TExt extends object = EmptyObject,
+> =
+  & Omit<AuthOptions<TRole, TExt>, CallerKindFlag>
+  & {
+    requireServiceRole?: false;
+    bypassWithServiceRole?: false;
+    bypassWithAnonRole?: false;
+    requireUserAuth?: true;
+  };
+
+/**
+ * Options allowed in `RouterConfig.defaultAuthentication`: everything except
+ * `allowedMethods` and the caller-kind flags, which would change `ctx.auth`
+ * behind the route's back. Use `createRouterKit().withAuthDefaults()` for
+ * defaults such as `requireServiceRole`.
+ */
+export type RouterAuthDefaults<
+  TRole = string,
+  TExt extends object = EmptyObject,
+> = Omit<AuthOptions<TRole, TExt>, "allowedMethods" | CallerKindFlag>;
+
 /**
  * Result of authentication operation
  * @template TUser - User data type
  * @template TRole - User role type
  */
-export interface AuthResult<TUser = unknown, TRole = string> {
+export interface AuthResult<
+  TUser = unknown,
+  TRole = string,
+  TAuthData = unknown,
+> {
   /** Error response if authentication failed */
   response?: Response;
   /** Supabase client instance */
@@ -153,6 +206,8 @@ export interface AuthResult<TUser = unknown, TRole = string> {
   serviceBypassed?: boolean;
   /** Whether the public anon key was accepted instead of a user token */
   anonBypassed?: boolean;
+  /** Arbitrary data from a custom auth handler, exposed as `ctx.auth.data` */
+  data?: TAuthData;
 }
 
 /**
@@ -168,10 +223,15 @@ export interface AuthResult<TUser = unknown, TRole = string> {
  * };
  * ```
  */
-export type AuthHandler<TRole = string, TUser = unknown> = (
+export type AuthHandler<
+  TRole = string,
+  TUser = unknown,
+  TExt extends object = EmptyObject,
+  TAuthData = unknown,
+> = (
   req: Request,
-  options: AuthOptions<TRole>,
-) => Promise<AuthResult<TUser, TRole>>;
+  options: AuthOptions<TRole, TExt>,
+) => Promise<AuthResult<TUser, TRole, TAuthData>>;
 
 /**
  * Custom user loader from database
@@ -194,25 +254,138 @@ export type UserLoader<TUser = unknown> = (
   supabaseClient: SupabaseClient,
 ) => Promise<TUser | null>;
 
+/** Who called an authenticated route */
+export type AuthKind = "user" | "service" | "anon";
+
+/** `ctx.auth` when a signed-in user called the route */
+export interface UserCaller<TUser = unknown, TData = unknown> {
+  /** Kind of caller */
+  kind: "user";
+  /** The signed-in user */
+  user: TUser;
+  /** Data from a custom auth handler (`AuthResult.data`) */
+  data?: TData;
+}
+
+/** `ctx.auth` when the secret (service_role) key was used */
+export interface ServiceCaller<TData = unknown> {
+  /** Kind of caller */
+  kind: "service";
+  /** No user */
+  user?: undefined;
+  /** Data from a custom auth handler (`AuthResult.data`) */
+  data?: TData;
+}
+
+/** `ctx.auth` when the route admitted a caller without a user */
+export interface AnonCaller<TData = unknown> {
+  /** Kind of caller */
+  kind: "anon";
+  /** No user */
+  user?: undefined;
+  /** Data from a custom auth handler (`AuthResult.data`) */
+  data?: TData;
+}
+
 /**
- * Context for authenticated routes
- * @template TUser - User data structure
+ * `ctx.auth`: who passed authentication. Narrow on `ctx.auth.kind`:
+ * - `user`: a signed-in user, available as `ctx.auth.user`
+ * - `service`: the secret / service_role key (no user, skips RBAC)
+ * - `anon`: no user (`bypassWithAnonRole`, or `requireUserAuth: false`)
+ *
+ * TypeScript narrows `ctx.auth` (not `ctx`) on `ctx.auth.kind`, so read the
+ * user from `ctx.auth.user` after the check.
  */
-export interface AuthenticatedContext<TUser = unknown> {
+export type CallerInfo<TUser = unknown, TData = unknown> =
+  | UserCaller<TUser, TData>
+  | ServiceCaller<TData>
+  | AnonCaller<TData>;
+
+/** Route context when a signed-in user called the route */
+export interface UserAuthContext<TUser = unknown, TData = unknown> {
+  /** Caller kind (`"user"`), the user and auth handler data */
+  auth: UserCaller<TUser, TData>;
   /** Authenticated user data */
   user: TUser;
-  /** Supabase client with user context */
+  /** Supabase client with the user's JWT (RLS applies) */
   supabaseClient: SupabaseClient;
-  /** Explicit service-role client when granted */
+  /** Service-role client, only if a custom auth handler grants one */
   serviceRoleClient?: SupabaseClient;
   /** Drizzle database client scoped to transaction pooler */
   db?: TransactionDbClient;
 }
 
+/** Route context when the secret (service_role) key was used */
+export interface ServiceAuthContext<TData = unknown> {
+  /** Caller kind (`"service"`) and auth handler data */
+  auth: ServiceCaller<TData>;
+  /** No user: the caller is a service */
+  user?: undefined;
+  /** Client for the caller's key (the admin client with default auth) */
+  supabaseClient: SupabaseClient;
+  /**
+   * Admin client bypassing RLS. Always set by the default auth handler;
+   * custom handlers set it themselves.
+   */
+  serviceRoleClient?: SupabaseClient;
+  /** Drizzle database client scoped to transaction pooler */
+  db?: TransactionDbClient;
+}
+
+/** Route context when the route admitted a caller without a user */
+export interface AnonAuthContext<TData = unknown> {
+  /** Caller kind (`"anon"`) and auth handler data */
+  auth: AnonCaller<TData>;
+  /** No user */
+  user?: undefined;
+  /** Client for the publishable (anon) key */
+  supabaseClient: SupabaseClient;
+  /** Never set for anonymous callers */
+  serviceRoleClient?: undefined;
+  /** Drizzle database client scoped to transaction pooler */
+  db?: TransactionDbClient;
+}
+
+/** Whether option `K` of `O` may hold the value `V` */
+export type FlagMayBe<O, K extends PropertyKey, V extends boolean> = K extends
+  keyof O ? V extends Exclude<O[K], undefined> ? true : false
+  : false;
+
+/**
+ * Caller kinds a route admits, derived from its `authentication` type.
+ * Literal flags (inferred by `defineRoute`) give an exact result; flags typed
+ * as plain `boolean` count as "may be set", so the result stays honest.
+ */
+export type AuthKindsOf<O> = FlagMayBe<O, "requireServiceRole", true> extends
+  true ? (O extends { requireServiceRole: true } ? "service" : AuthKind)
+  :
+    | "user"
+    | (FlagMayBe<O, "bypassWithServiceRole", true> extends true ? "service"
+      : never)
+    | (FlagMayBe<O, "bypassWithAnonRole", true> extends true ? "anon"
+      : never)
+    | (FlagMayBe<O, "requireUserAuth", false> extends true ? "anon" : never);
+
+/** Authenticated part of the route context for the given `authentication` */
+export type AuthContextOf<TUser, TData, O> = Extract<
+  | UserAuthContext<TUser, TData>
+  | ServiceAuthContext<TData>
+  | AnonAuthContext<TData>,
+  { auth: { kind: AuthKindsOf<O> } }
+>;
+
+/**
+ * Context for routes that only admit signed-in users
+ * @deprecated Use {@link UserAuthContext}
+ */
+export type AuthenticatedContext<TUser = unknown> = UserAuthContext<TUser>;
+
 /**
  * Context for public routes (`authRequired: false`)
  */
 export interface PublicContext {
+  /** No authentication ran */
+  auth?: undefined;
   /** Never set on public routes */
   user?: undefined;
   /** Never set on public routes */
@@ -229,6 +402,8 @@ export interface PublicContext {
  * @template TAuth - Whether authentication is required
  * @template TUser - User data type
  * @template TContainer - Service container type (extends ServiceContainer)
+ * @template TAuthOpts - Type of the route's `authentication` (decides `ctx.auth.kind`)
+ * @template TAuthData - Type of `ctx.auth.data` from a custom auth handler
  *
  * @example
  * ```typescript
@@ -256,6 +431,8 @@ export type RouteContext<
   TAuth extends boolean = false,
   TUser = unknown,
   TContainer extends ServiceContainer = ServiceContainer,
+  TAuthOpts = UserOnlyAuthOptions,
+  TAuthData = unknown,
 > =
   & {
     /** Original Request object */
@@ -273,7 +450,34 @@ export type RouteContext<
     /** Optional Drizzle database client (transaction pooler) */
     db?: TransactionDbClient;
   }
-  & (TAuth extends true ? AuthenticatedContext<TUser> : PublicContext);
+  & (TAuth extends true ? AuthContextOf<TUser, TAuthData, TAuthOpts>
+    : PublicContext);
+
+/**
+ * The matched route, as declared (not the concrete URL)
+ */
+export interface RouteInfo {
+  /** HTTP method of the route (`GET` for HEAD requests served by it) */
+  method: string;
+  /** Path template including basePath, e.g. `/api/users/:id` */
+  path: string;
+  /** OpenAPI tags, including the router's `defaultTags` */
+  tags: readonly string[];
+}
+
+/**
+ * Details passed to `RouterConfig.onError`
+ */
+export interface RouterErrorInfo<TUser = unknown> {
+  /** The request being processed */
+  req: Request;
+  /** Request ID, when a route matched */
+  requestId?: string;
+  /** Matched route, when a route matched */
+  route?: RouteInfo;
+  /** Authenticated user, when authentication already ran */
+  user?: TUser;
+}
 
 /**
  * Middleware context type
@@ -288,6 +492,8 @@ export interface MiddlewareContext<
   req: Request;
   /** Request ID for tracing */
   requestId: string;
+  /** Matched route (global middlewares run after matching, so always set) */
+  route: RouteInfo;
   /** Path parameters (validated output once validation ran) */
   params: Record<string, unknown>;
   /** Query parameters (validated output once validation ran) */
@@ -296,6 +502,8 @@ export interface MiddlewareContext<
   body: unknown;
   /** Service container with core and custom services */
   services: TContainer;
+  /** Caller kind, user and auth data (set once authentication ran) */
+  auth?: CallerInfo<TUser>;
   /** Authenticated user (when available) */
   user?: TUser;
   /** Supabase client scoped to authenticated user */
@@ -375,8 +583,19 @@ export type RouteHandler<
   TAuth extends boolean,
   TUser,
   TContainer extends ServiceContainer,
+  TAuthOpts = UserOnlyAuthOptions,
+  TAuthData = unknown,
 > = (
-  ctx: RouteContext<TParams, TQuery, TBody, TAuth, TUser, TContainer>,
+  ctx: RouteContext<
+    TParams,
+    TQuery,
+    TBody,
+    TAuth,
+    TUser,
+    TContainer,
+    TAuthOpts,
+    TAuthData
+  >,
 ) => Promise<unknown>;
 
 /**
@@ -392,9 +611,21 @@ export type RouteDefinitionInput<
   TQuery = InferQueryFromSchema<TSchema>,
   TBody = InferBodyFromSchema<TSchema>,
   TContainer extends ServiceContainer = ServiceContainer,
+  TAuthOpts = UserOnlyAuthOptions<TRole>,
+  TAuthData = unknown,
 > =
   & Omit<
-    RouteDef<TRole, TUser, TParams, TQuery, TBody, TAuth, TContainer>,
+    RouteDef<
+      TRole,
+      TUser,
+      TParams,
+      TQuery,
+      TBody,
+      TAuth,
+      TContainer,
+      TAuthOpts,
+      TAuthData
+    >,
     "fullPath" | "path" | "requestSchema" | "authRequired"
   >
   & {
@@ -472,6 +703,8 @@ export interface RouteDef<
   TBody = unknown,
   TAuth extends boolean = boolean,
   TContainer extends ServiceContainer = ServiceContainer,
+  TAuthOpts = UserOnlyAuthOptions<TRole>,
+  TAuthData = unknown,
 > {
   /** HTTP method */
   method: string;
@@ -499,8 +732,11 @@ export interface RouteDef<
   includeDefaultErrors?: boolean;
   /** Disable automatic DTO validation */
   disableDTOValidation?: boolean;
-  /** Authentication options */
-  authentication?: AuthOptions<TRole>;
+  /**
+   * Authentication options. Bypass flags widen `ctx.auth.kind` (and make
+   * `ctx.user` optional); narrow with `if (ctx.auth.kind === "user")`.
+   */
+  authentication?: TAuthOpts;
   /** Shorthand for authentication.allowedRoles */
   allowedRoles?: TRole[];
   /** CORS configuration (overrides the router-level `corsHeaders`) */
@@ -519,7 +755,16 @@ export interface RouteDef<
   /** Opt-in access to transaction pooler database client */
   useDatabase?: boolean;
   /** Route handler function */
-  handler: RouteHandler<TParams, TQuery, TBody, TAuth, TUser, TContainer>;
+  handler: RouteHandler<
+    TParams,
+    TQuery,
+    TBody,
+    TAuth,
+    TUser,
+    TContainer,
+    TAuthOpts,
+    TAuthData
+  >;
 }
 
 /**
@@ -576,6 +821,8 @@ export interface RouterConfig<
   TRole = string,
   TUser = Record<string, unknown>,
   TContainer extends ServiceContainer = ServiceContainer,
+  TExt extends object = EmptyObject,
+  TAuthData = unknown,
 > {
   /** Base path for all routes */
   basePath: string;
@@ -584,7 +831,7 @@ export interface RouterConfig<
   /** Route definitions */
   routes: Array<AnyRouteDef<TRole, TUser, TContainer>>;
   /** Custom authentication handler */
-  authHandler?: AuthHandler<TRole, TUser>;
+  authHandler?: AuthHandler<TRole, TUser, TExt, TAuthData>;
   /**
    * Load the user (including its role) from your database after the default
    * auth handler verified the token. Without it, the user is built from the
@@ -605,6 +852,25 @@ export interface RouterConfig<
    * `ctx.user`/`ctx.body` are only populated after `await next()`.
    */
   middlewares?: Middleware<TUser, TContainer>[];
+  /**
+   * Authentication options applied to every authenticated route, merged
+   * under the route's own `authentication` (shallow; the route wins).
+   * Ignored for routes with `authRequired: false`. Caller-kind flags
+   * (`requireServiceRole`, `bypassWith*`, `requireUserAuth`) are not accepted
+   * here because route types could not see them; use
+   * `createRouterKit().withAuthDefaults()` for those.
+   */
+  defaultAuthentication?: RouterAuthDefaults<TRole, TExt>;
+  /**
+   * Called for unhandled errors (not thrown Responses), after
+   * `services.logger.error`. Return a Response to replace the generic 500.
+   * Not called for errors already handled by a middleware such as
+   * `errorHandlerMiddleware` or `catchErrors`.
+   */
+  onError?: (
+    error: unknown,
+    info: RouterErrorInfo<TUser>,
+  ) => void | Response | Promise<void | Response>;
   /** OpenAPI security schemes */
   securitySchemes?: Record<string, OpenAPISchema>;
   /** Global CORS configuration (default: permissive `*`) */
@@ -631,7 +897,17 @@ export type AnyRouteDef<
   TRole = Erased,
   TUser = Erased,
   TContainer extends ServiceContainer = Erased,
-> = RouteDef<TRole, TUser, Erased, Erased, Erased, boolean, TContainer>;
+> = RouteDef<
+  TRole,
+  TUser,
+  Erased,
+  Erased,
+  Erased,
+  boolean,
+  TContainer,
+  Erased,
+  Erased
+>;
 
 /**
  * Compiled route with erased params/query/body/auth generics
@@ -640,7 +916,17 @@ export type AnyCompiledRoute<
   TRole = Erased,
   TUser = Erased,
   TContainer extends ServiceContainer = Erased,
-> = CompiledRoute<TRole, TUser, Erased, Erased, Erased, boolean, TContainer>;
+> = CompiledRoute<
+  TRole,
+  TUser,
+  Erased,
+  Erased,
+  Erased,
+  boolean,
+  TContainer,
+  Erased,
+  Erased
+>;
 
 /**
  * Compiled route with regex pattern
@@ -653,7 +939,20 @@ export interface CompiledRoute<
   TBody = unknown,
   TAuth extends boolean = boolean,
   TContainer extends ServiceContainer = ServiceContainer,
-> extends RouteDef<TRole, TUser, TParams, TQuery, TBody, TAuth, TContainer> {
+  TAuthOpts = UserOnlyAuthOptions<TRole>,
+  TAuthData = unknown,
+> extends
+  RouteDef<
+    TRole,
+    TUser,
+    TParams,
+    TQuery,
+    TBody,
+    TAuth,
+    TContainer,
+    TAuthOpts,
+    TAuthData
+  > {
   /** Regex pattern for URL matching */
   regex: RegExp;
   /** Extracted parameter names */
@@ -666,6 +965,12 @@ export interface CompiledRoute<
 export interface Router {
   /** Request handler function */
   handler: (req: Request) => Promise<Response>;
+  /**
+   * The route `handler` would dispatch `req` to, using the same matching
+   * (including HEAD → GET). Null for OPTIONS, 404 and 405. Useful to name
+   * tracing spans and metrics by route template before calling `handler`.
+   */
+  match: (req: Request) => RouteInfo | null;
   /** OpenAPI specification generator */
   openapi: () => {
     info: { title: string; version: string };

@@ -16,7 +16,8 @@
     "typescript-eslint": "npm:typescript-eslint@^8.70.1",
     "@std/cli": "jsr:@std/cli@^1.0.28",
     "@upstash/ratelimit": "npm:@upstash/ratelimit@^2.2.0",
-    "@upstash/redis": "npm:@upstash/redis@^1.39.0"
+    "@upstash/redis": "npm:@upstash/redis@^1.39.0",
+    "@std/testing": "jsr:@std/testing@^1.0.21"
   },
   "tasks": {
     "check": "deno check mod.ts examples/ tests/*.ts tests/integration/*.ts",
@@ -51,6 +52,7 @@
     "include": [
       "mod.ts",
       "router.ts",
+      "router-kit.ts",
       "core/*.ts",
       "database/*.ts",
       "routing/*.ts",
